@@ -1,0 +1,11 @@
+# Runtime state — never commit a trading ledger
+data/
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/

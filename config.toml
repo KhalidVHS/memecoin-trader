@@ -1,0 +1,90 @@
+# The only file you need to edit.
+
+[portfolio]
+starting_cash_usd = 1000.0
+
+# Three Solana memecoins. `mint` addresses are verified live at startup against
+# DexScreener — if one is wrong or the token has migrated pools, startup fails
+# loudly rather than trading against a stale address.
+[[coins]]
+symbol = "BONK"
+mint = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+# Terms searched for on Reddit when building the sentiment brief.
+aliases = ["BONK", "bonkcoin"]
+
+[[coins]]
+symbol = "WIF"
+mint = "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm"
+aliases = ["WIF", "dogwifhat", "dogwifcoin"]
+
+[[coins]]
+symbol = "POPCAT"
+mint = "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr"
+aliases = ["POPCAT", "popcat"]
+
+[model]
+name = "claude-opus-5"
+effort = "high"          # "low" | "medium" | "high" — a knob, not a constant
+max_tokens = 8000
+# Per-million-token prices, used only to report spend in `memetrader report`.
+price_input_per_mtok = 5.0
+price_output_per_mtok = 25.0
+price_cache_read_per_mtok = 0.5
+
+[cadence]
+fast_tick_seconds = 60       # mark the book, enforce stops — no model call
+slow_tick_seconds = 900      # full LLM decision cycle (15 min)
+
+[risk]
+max_position_pct = 0.30      # of total book value
+stop_loss_pct = 0.15         # forced exit at -15% from entry
+min_trade_usd = 10.0
+max_price_impact_pct = 3.0
+max_snapshot_age_seconds = 90
+min_liquidity_usd = 50_000.0
+# No max-trades-per-day and no minimum hold time. Deliberate.
+
+[execution]
+# Fill realism. Defaults are researched, not invented — see README.
+slippage_bps_fallback = 50.0      # used only when Jupiter is unreachable
+gas_usd_per_swap = 0.21           # ~0.002 SOL; rises hard during congestion
+failed_tx_rate = 0.06             # a failed swap still pays full gas
+default_pool_fee_pct = 0.25       # when routePlan label is unrecognised
+
+[execution.pool_fee_pct]
+Raydium = 0.25
+"Raydium CLMM" = 0.25
+PumpSwap = 0.30
+Pump = 0.30
+Orca = 0.30
+Whirlpool = 0.30
+Meteora = 0.25
+"Meteora DLMM" = 0.25
+
+[data]
+# DexScreener and GeckoTerminal are keyless. Jupiter uses lite-api.jup.ag
+# unless JUPITER_API_KEY is set in the environment.
+dexscreener_base = "https://api.dexscreener.com"
+geckoterminal_base = "https://api.geckoterminal.com/api/v2"
+jupiter_base = "https://lite-api.jup.ag"
+jupiter_base_keyed = "https://api.jup.ag"
+http_timeout_seconds = 15.0
+candles_5m = 100             # enough history for EMA21 / BB20 / ATR14
+candles_1h = 100
+
+[sentiment]
+enabled = true
+cache_ttl_seconds = 600      # sentiment moves slower than price
+lookback_hours = 24
+baseline_days = 7            # window for the mention z-score
+subreddits = [
+    "CryptoCurrency",
+    "CryptoMoonShots",
+    "SatoshiStreetBets",
+    "solana",
+    "pumpfun",
+]
+
+[prompt]
+# How many past decisions the model sees, one compressed line each.
+decision_history = 10

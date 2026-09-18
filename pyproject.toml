@@ -1,0 +1,33 @@
+[project]
+name = "memetrader"
+version = "0.1.0"
+description = "LLM-driven Solana memecoin paper trader"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "anthropic>=1.0.0",
+    "httpx>=0.28",
+    "pydantic>=2.9",
+    "typer>=0.15",
+    "rich>=13.9",
+    "pandas>=2.2",
+    "numpy>=2.1",
+    "praw>=8.0",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+memetrader = "memetrader.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
