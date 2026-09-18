@@ -80,6 +80,20 @@ _ARCTIC_MAX_LIMIT = 100
 _ARCTIC_MAX_PAGES = 6  # 600 posts per subreddit per window is plenty
 _ARCTIC_SPACING_S = 0.6  # the host 422s with "Timeout. Maybe slow down a bit"
 
+# Ceiling on one ``/new`` sweep. Reddit pages listings 100 at a time and caps
+# pagination at 1000, so this is 5 requests per subreddit worst case, against a
+# 100 req/min budget. It only binds on a subreddit posting faster than
+# _PRAW_NEW_LIMIT per lookback window — r/CryptoCurrency runs a few hundred a
+# day, so the window closes first and the sweep stops early.
+_PRAW_NEW_LIMIT = 500
+
+# Consecutive out-of-window posts required before a ``/new`` sweep concludes it
+# has walked off the end of the window. A listing is reverse-chronological, so
+# one *ought* to be enough — but a pinned or recently-approved submission can
+# surface out of order, and treating a single stray as the boundary would
+# truncate the whole subreddit to nothing.
+_PRAW_STALE_RUN = 3
+
 # How long one subreddit sweep is reused across coins within a single tick.
 # Every coin in a tick shares the same lookback window, so re-pulling it per
 # coin would triple the request count against a host that already rate-limits.
@@ -766,9 +780,9 @@ class PrawProvider:
 
     PRAW 8.0.3 notes (checked against the installed package, not 7.x memory):
 
-    * ``Subreddit.search(query, *, sort=, syntax=, time_filter=, **kwargs)`` —
-      ``sort``/``syntax``/``time_filter`` are **keyword-only** in 8.x. The 7.x
-      habit of ``search(q, "new", "lucene", "day")`` is a ``TypeError`` now.
+    * ``Subreddit.new(**Unpack[ListingGeneratorKwargs])`` — ``limit=`` still
+      works and still means "stop after N", with ``None`` for "as many as
+      Reddit will paginate" (1000).
     * ``Reddit.__init__(site_name=None, *, config_interpolation=None,
       requestor_class=None, requestor_kwargs=None, **config_settings)`` —
       ``site_name`` is the only positional parameter; credentials still arrive
@@ -780,21 +794,35 @@ class PrawProvider:
       ``limit=`` still works.
     * Riding on prawcore 4.0.0.
 
-    Subreddits are queried as one ``a+b+c`` multireddit, which is a single
-    search per coin instead of one per subreddit. Reddit's own tokenizer is
-    treated as a *prefilter* only — every result is re-checked against the
-    word-boundary pattern locally, because Reddit stems and will happily return
-    "wife" for a "wif" query.
+    **Sweeps ``/new`` rather than running a search.** This is the difference
+    between current data and nearly-current data, and it is the whole reason to
+    prefer PRAW over the archive mirror. Reddit's search index is populated
+    asynchronously, so a post is live on ``/new`` before it is findable by
+    ``search()`` — the same class of staleness this module already refuses to
+    paper over in ``ArcticShiftProvider``, merely smaller. ``/new`` is a
+    listing, not a query, so there is nothing to wait for.
+
+    Three things fall out of the switch, all good:
+
+    * Reddit's tokenizer leaves the picture entirely. It was only ever a
+      prefilter — every hit is re-checked locally by ``matching_posts``,
+      because Reddit stems and will happily return "wife" for a "wif" query —
+      and a prefilter that can silently drop a real mention is worse than none.
+    * One sweep serves every coin, so three coins cost one pass over each
+      subreddit instead of three searches.
+    * It is the same shape as the Arctic Shift sweep, so both providers now
+      hand ``matching_posts`` the same unfiltered window and the matching
+      semantics live in exactly one place.
     """
 
     source = "praw"
-    #: Queries live Reddit, and its result set is already narrowed to one coin —
-    #: so an old newest-post means the coin is quiet, not that the index is
-    #: stale. Inferring lag from it would silently suppress real readings.
+    #: Live Reddit via ``/new``: no search index sits between the post being
+    #: made and us seeing it, so there is no lag to measure or report.
     index_lags = False
 
     def __init__(self, reddit: Any | None = None) -> None:
         self._reddit = reddit
+        self._memo: tuple[float, list[Post], list[str]] | None = None
 
     def _client(self, cfg: Config) -> Any:
         if self._reddit is None:
@@ -811,40 +839,64 @@ class PrawProvider:
             self._reddit.read_only = True
         return self._reddit
 
-    @staticmethod
-    def _time_filter(lookback_hours: int) -> str:
-        if lookback_hours <= 24:
-            return "day"
-        if lookback_hours <= 24 * 7:
-            return "week"
-        return "month"
-
     def posts(
         self, coin: CoinConfig, cfg: Config, now: float
     ) -> tuple[list[Post], list[str]]:
+        """Every post in the lookback window across the configured subreddits.
+
+        ``coin`` is unused, exactly as in ``ArcticShiftProvider.posts``: one
+        ``/new`` sweep covers all three coins and ``matching_posts`` does the
+        per-coin filtering afterwards.
+
+        Returns ``(posts, failures)``. A subreddit that errors is skipped and
+        named in ``failures``, so a dead sub shows up as a degraded brief rather
+        than a quietly lower mention count. All of them failing is a dead
+        source, not a quiet day, and raises ``SourceUnavailable``.
+        """
         scfg = cfg.sentiment
         if not scfg.subreddits:
             raise SourceUnavailable("no subreddits configured")
-        multi = "+".join(scfg.subreddits)
-        # Quoted terms OR'd together. Reddit's index is only a prefilter here —
-        # every hit is re-checked locally by ``matching_posts``.
-        query = " OR ".join(f'"{a}"' for a in coin.aliases)
-        subreddit = self._client(cfg).subreddit(multi)
-        results = subreddit.search(
-            query,
-            # PRAW 8: these three are keyword-only. Passing them positionally,
-            # as 7.x allowed, is a TypeError.
-            sort="new",
-            syntax="lucene",
-            time_filter=self._time_filter(scfg.lookback_hours),
-            limit=None,
-        )
+
+        # One sweep serves every coin — the window does not depend on which coin
+        # is asking, and Reddit's 100 queries/min is worth not spending three
+        # times over on identical bytes.
+        if self._memo is not None and abs(now - self._memo[0]) < _MEMO_SECONDS:
+            return list(self._memo[1]), list(self._memo[2])
+
+        after = now - scfg.lookback_hours * _SECONDS_PER_HOUR
+        reddit = self._client(cfg)
         out: dict[str, Post] = {}
-        for submission in results:
-            post = _post_from_praw(submission)
-            if post is not None:
-                out[post.id] = post
-        return list(out.values()), []
+        failures: list[str] = []
+        for name in scfg.subreddits:
+            try:
+                stale_run = 0
+                for submission in reddit.subreddit(name).new(limit=_PRAW_NEW_LIMIT):
+                    post = _post_from_praw(submission)
+                    if post is None:
+                        continue
+                    if post.created_utc < after:
+                        # ``/new`` is reverse-chronological, so the first old post
+                        # is normally the end of the window — but a pinned or
+                        # recently-approved submission can surface out of order,
+                        # and stopping on one of those would silently truncate an
+                        # entire subreddit to nothing. Require a short run of
+                        # them before believing we are past the edge.
+                        stale_run += 1
+                        if stale_run >= _PRAW_STALE_RUN:
+                            break
+                        continue
+                    stale_run = 0
+                    out[post.id] = post
+            except Exception as exc:
+                log.warning("praw: r/%s failed: %s", name, exc)
+                failures.append(name)
+
+        if failures and len(failures) == len(scfg.subreddits):
+            raise SourceUnavailable(
+                f"praw returned nothing for any of {len(failures)} subreddits"
+            )
+        self._memo = (now, list(out.values()), list(failures))
+        return list(out.values()), failures
 
     def fetch(self, coin: CoinConfig, cfg: Config) -> SentimentBrief | None:
         """Standalone brief, with no cross-run baseline. See the note on
@@ -859,6 +911,7 @@ class PrawProvider:
             now,
             history=None,
             extra_reasons=_failure_reasons(failures),
+            observed_through=sweep_observed_through(self, found, now),
         )
 
 

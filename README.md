@@ -106,10 +106,31 @@ the decision log is a one-line change.
 
 ## Optional credentials
 
-**Reddit** (free, ~2 minutes) improves the sentiment brief. Create a "script"
-app at [reddit.com/prefs/apps](https://www.reddit.com/prefs/apps) and put the ID
-and secret in `.env`. Without it, sentiment falls back to the keyless Arctic
-Shift source plus the on-chain flow numbers.
+**Reddit** (free, ~2 minutes) is what makes the sentiment brief *current*, and
+it is the one credential worth bothering with. Create a "script" app at
+[reddit.com/prefs/apps](https://www.reddit.com/prefs/apps) — the redirect URI
+can be `http://localhost:8080`, it is never used — and set three variables in
+`.env`:
+
+```
+REDDIT_CLIENT_ID=<the string under the app name>
+REDDIT_CLIENT_SECRET=<the "secret" field>
+REDDIT_USER_AGENT=memetrader/0.1 by u/<your-username>
+```
+
+Reddit rejects generic user agents, so the third is not optional padding.
+
+Without credentials the bot still runs: sentiment falls back to the keyless
+Arctic Shift mirror plus the on-chain flow numbers. **The difference is
+freshness.** Arctic Shift is an archive, and its index measurably trails live
+Reddit — ~10 hours behind on a check on 2026-09-18. The code will not paper over
+that: when a source's index has not reached the current hour, `mention_velocity_1h`
+is reported as `n/a` rather than `0.0`, and the prompt says so explicitly, because
+"nobody is talking about this" and "we have not looked yet" are opposite trades.
+Run `memetrader status` and look for the `vel1h n/a` line to see which one you are on.
+
+With credentials, the sweep reads each subreddit's `/new` listing directly — live,
+with no search index in between — so the current hour is always observed.
 
 **Jupiter** (free) moves quotes from `lite-api.jup.ag`, whose rate limit
 deliberately decays, to `api.jup.ag`. Set `JUPITER_API_KEY` in `.env`.

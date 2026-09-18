@@ -944,25 +944,47 @@ class FakeSubreddit:
         self._results = results
         self._recorder = recorder
 
-    def search(self, query, *, sort="relevance", syntax="lucene", time_filter="all", **kwargs):
-        # Keyword-only, matching PRAW 8.0.3's actual signature. If sentiment.py
-        # ever reverts to the 7.x positional style this raises TypeError.
-        self._recorder.append(
-            {"query": query, "sort": sort, "syntax": syntax, "time_filter": time_filter, **kwargs}
+    def new(self, **kwargs):
+        # ``new`` takes only listing kwargs in PRAW 8. Results are handed back
+        # newest-first, which is what the real listing guarantees and what the
+        # sweep's early stop depends on.
+        self._recorder.append({"subreddit": self.display_name, **kwargs})
+        ordered = sorted(self._results, key=lambda s: s.created_utc, reverse=True)
+        limit = kwargs.get("limit")
+        return iter(ordered if limit is None else ordered[:limit])
+
+    def search(self, *a, **kw):  # pragma: no cover - must never be reached
+        raise AssertionError(
+            "PrawProvider must sweep /new, not search: Reddit's search index is "
+            "populated asynchronously and lags the listing."
         )
-        return iter(self._results)
 
 
 class FakeReddit:
     def __init__(self, results):
         self._results = results
-        self.searches: list[dict] = []
+        self.listings: list[dict] = []
         self.requested: list[str] = []
         self.read_only = False
 
     def subreddit(self, display_name):
         self.requested.append(display_name)
-        return FakeSubreddit(display_name, self._results, self.searches)
+        return FakeSubreddit(display_name, self._results, self.listings)
+
+
+class UnsortedReddit(FakeReddit):
+    """Hands back results in the order given, not newest-first.
+
+    Reddit's ``/new`` is reverse-chronological *except* for stickies, so the
+    sorted stub cannot express the one case the sweep's early stop has to
+    survive.
+    """
+
+    def subreddit(self, display_name):
+        self.requested.append(display_name)
+        sub = FakeSubreddit(display_name, self._results, self.listings)
+        sub.new = lambda **kw: iter(self._results)  # type: ignore[method-assign]
+        return sub
 
 
 class TestPrawProvider:
@@ -979,26 +1001,86 @@ class TestPrawProvider:
         posts, failures = provider.posts(WIF, cfg, now)
         assert failures == []
         assert {p.id for p in posts} == {"s1", "s2", "s3"}
-        # "my wife" must not survive the local word-boundary re-check, even
-        # though Reddit's stemmer handed it to us.
+        # "my wife" must not survive the local word-boundary re-check. Under
+        # `search` Reddit's stemmer was what handed it to us; under `/new` the
+        # sweep is unfiltered, so this check is now the *only* thing standing
+        # between a stray substring and a mention count.
         assert {p.id for p in S.matching_posts(posts, WIF.aliases)} == {"s1", "s3"}
 
-    def test_searches_one_multireddit_with_ord_aliases(self, cfg):
+    def test_sweeps_new_per_subreddit_not_a_search(self, cfg):
         reddit = FakeReddit([])
         S.PrawProvider(reddit=reddit).posts(WIF, cfg, time.time())
-        assert reddit.requested == ["CryptoCurrency+solana"]  # one call, not two
-        call = reddit.searches[0]
-        assert '"WIF"' in call["query"] and '"dogwifhat"' in call["query"]
-        assert " OR " in call["query"]
-        assert call["sort"] == "new"
-        assert call["syntax"] == "lucene"
-        assert call["time_filter"] == "day"  # lookback_hours == 24
+        # One listing per subreddit — and emphatically not a `a+b` multireddit
+        # search, which would put Reddit's lagging search index in the path.
+        assert reddit.requested == ["CryptoCurrency", "solana"]
+        assert [c["subreddit"] for c in reddit.listings] == ["CryptoCurrency", "solana"]
+        assert all(c["limit"] == S._PRAW_NEW_LIMIT for c in reddit.listings)
 
-    @pytest.mark.parametrize(
-        "hours,expected", [(1, "day"), (24, "day"), (48, "week"), (168, "week"), (400, "month")]
-    )
-    def test_time_filter_mapping(self, hours, expected):
-        assert S.PrawProvider._time_filter(hours) == expected
+    def test_the_sweep_is_shared_across_coins(self, cfg):
+        now = time.time()
+        reddit = FakeReddit([FakeSubmission("s1", "WIF and BONK", "alice", now - 300)])
+        provider = S.PrawProvider(reddit=reddit)
+        provider.posts(WIF, cfg, now)
+        provider.posts(BONK, cfg, now)
+        # Three coins must not cost three sweeps: the window does not depend on
+        # which coin is asking.
+        assert reddit.requested == ["CryptoCurrency", "solana"]
+
+    def test_posts_outside_the_window_are_dropped(self, cfg):
+        now = time.time()
+        old = now - 30 * HOUR  # cfg lookback is 24h
+        reddit = FakeReddit(
+            [
+                FakeSubmission("fresh", "WIF now", "alice", now - 300),
+                FakeSubmission("old1", "WIF then", "bob", old),
+                FakeSubmission("old2", "WIF then", "carol", old - 60),
+                FakeSubmission("old3", "WIF then", "dave", old - 120),
+                FakeSubmission("old4", "WIF then", "erin", old - 180),
+            ]
+        )
+        posts, _ = S.PrawProvider(reddit=reddit).posts(WIF, cfg, now)
+        assert {p.id for p in posts} == {"fresh"}
+
+    def test_a_single_out_of_order_post_does_not_end_the_sweep(self, cfg):
+        """A pinned submission surfacing out of order must not truncate the sub.
+
+        ``/new`` is reverse-chronological, so it is tempting to stop at the
+        first old post — but one stray would then cost the entire subreddit.
+        """
+        now = time.time()
+        reddit = UnsortedReddit(
+            # An old sticky at the head of an otherwise fresh listing.
+            [FakeSubmission("pinned", "WIF megathread", "mod", now - 40 * HOUR)]
+            + [FakeSubmission(f"s{i}", "WIF talk", f"u{i}", now - 300 - i) for i in range(4)]
+        )
+        posts, _ = S.PrawProvider(reddit=reddit).posts(WIF, cfg, now)
+        assert {p.id for p in posts} == {"s0", "s1", "s2", "s3"}
+
+    def test_a_run_of_old_posts_does_end_the_sweep(self, cfg):
+        """The tolerance is for strays, not a licence to read the whole listing."""
+        now = time.time()
+        old = now - 40 * HOUR
+        reddit = UnsortedReddit(
+            [FakeSubmission(f"old{i}", "WIF", f"u{i}", old - i) for i in range(S._PRAW_STALE_RUN)]
+            + [FakeSubmission("unreached", "WIF", "late", now - 300)]
+        )
+        posts, _ = S.PrawProvider(reddit=reddit).posts(WIF, cfg, now)
+        assert posts == []
+
+    def test_one_dead_subreddit_is_reported_not_swallowed(self, cfg):
+        now = time.time()
+
+        class HalfDead(FakeReddit):
+            def subreddit(self, display_name):
+                if display_name == "solana":
+                    raise RuntimeError("prawcore: 404 banned")
+                return super().subreddit(display_name)
+
+        reddit = HalfDead([FakeSubmission("s1", "WIF up", "alice", now - 300)])
+        posts, failures = S.PrawProvider(reddit=reddit).posts(WIF, cfg, now)
+        assert [p.id for p in posts] == ["s1"]
+        # A lower mention count with no explanation is worse than no count.
+        assert failures == ["solana"]
 
     def test_end_to_end_brief(self, cfg):
         now = time.time()
