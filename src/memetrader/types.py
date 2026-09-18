@@ -59,12 +59,20 @@ class Candle:
 
 @dataclass(frozen=True, slots=True)
 class PriceLadder:
-    """Percent price change over each window. Whole percents, e.g. -4.2."""
+    """Percent price change over each window. Whole percents, e.g. -4.2.
 
-    m5: float
-    h1: float
-    h6: float
-    h24: float
+    ``None`` means DexScreener did not report that window, which is common —
+    it omits the key rather than sending zero, and on a live sample 13 of 30
+    pairs had no ``m5`` at all (including BONK's best pool). "No 5-minute move
+    was reported" and "the price was flat over 5 minutes" are very different
+    claims to a trading model, so we keep them distinct all the way to the
+    prompt, which renders ``None`` as n/a.
+    """
+
+    m5: float | None
+    h1: float | None
+    h6: float | None
+    h24: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,8 +231,13 @@ class SentimentBrief:
     ts: float  # epoch seconds
     source: Literal["praw", "arctic_shift"]
 
-    mention_velocity_1h: float  # mentions/hour over the last hour
-    mention_velocity_24h: float  # mentions/hour averaged over 24h
+    # ``None`` means the period was not observed, which is emphatically not the
+    # same as "nobody posted". Arctic Shift's index runs hours behind live
+    # Reddit, so the most recent hour routinely contains no indexed posts at
+    # all; reporting that as 0.0 mentions/hour would hand the model a confident
+    # "attention is flat" — a bearish read — built out of missing data.
+    mention_velocity_1h: float | None  # mentions/hour over the last hour
+    mention_velocity_24h: float | None  # mentions/hour over the observed window
     mention_zscore_7d: float | None  # is current attention unusual for this coin
     unique_contributors_24h: int
     contributor_to_post_ratio: float | None  # low = few accounts posting a lot
@@ -375,6 +388,7 @@ class RiskVerdict:
 
     approved: bool
     approved_usd: float
+    symbol: str | None = None  # which coin this verdict is about
     rule: str | None = None  # the rule that fired, e.g. "max_position_pct"
     reason: str | None = None  # human-readable, fed back to the model next tick
     notes: tuple[str, ...] = ()

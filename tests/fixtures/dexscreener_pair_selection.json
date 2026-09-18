@@ -1,0 +1,103 @@
+{
+  "_comment": [
+    "Hand-built DexScreener response for pair-selection tests. Modelled on the",
+    "real shapes in dexscreener_tokens.json but arranged so that every wrong",
+    "selection rule picks a different pair than the right one:",
+    "  pairs[0]           -> 5zDeadPoolNeverPickMe (dust, listed first)",
+    "  max liquidity.usd  -> CdFakeDlmmQuotedInJunk (fake, quoted in a pump token)",
+    "  correct answer     -> 3UBestRealUsdcPool (max liquidity among SOL/USDC/USDT)",
+    "It also exercises string numerics, a missing priceChange.m5 key, and an",
+    "epoch-millisecond pairCreatedAt."
+  ],
+  "schemaVersion": "1.0.0",
+  "pairs": [
+    {
+      "chainId": "solana",
+      "dexId": "orca",
+      "pairAddress": "5zDeadPoolNeverPickMe",
+      "baseToken": {
+        "address": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+        "name": "Bonk",
+        "symbol": "Bonk"
+      },
+      "quoteToken": {
+        "address": "So11111111111111111111111111111111111111112",
+        "name": "Wrapped SOL",
+        "symbol": "SOL"
+      },
+      "priceNative": "0.00000002500",
+      "priceUsd": "0.000002100",
+      "txns": {
+        "m5": { "buys": 0, "sells": 0 },
+        "h1": { "buys": 1, "sells": 0 },
+        "h6": { "buys": 3, "sells": 2 },
+        "h24": { "buys": 9, "sells": 7 }
+      },
+      "volume": { "h24": 412.5, "h6": 100.0, "h1": 12.0, "m5": 0 },
+      "priceChange": { "h1": 0.1, "h6": 0.2, "h24": 0.3 },
+      "liquidity": { "usd": 12000.0, "base": 4000000000, "quote": 30.5 },
+      "fdv": 261000000,
+      "marketCap": 261000000,
+      "pairCreatedAt": 1671980424000
+    },
+    {
+      "chainId": "solana",
+      "dexId": "meteora",
+      "labels": ["DLMM"],
+      "pairAddress": "CdFakeDlmmQuotedInJunk",
+      "baseToken": {
+        "address": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+        "name": "Bonk",
+        "symbol": "Bonk"
+      },
+      "quoteToken": {
+        "address": "FeSENori1vjgUYP63oPPeNJtjXeLpm9sht8UN2k4pump",
+        "name": "Liquidity Lords",
+        "symbol": "L$L"
+      },
+      "priceNative": "0.3198",
+      "priceUsd": "0.01434",
+      "txns": {
+        "m5": { "buys": 0, "sells": 0 },
+        "h1": { "buys": 3, "sells": 1 },
+        "h6": { "buys": 10, "sells": 22 },
+        "h24": { "buys": 29, "sells": 41 }
+      },
+      "volume": { "h24": 98467.3, "h6": 98389, "h1": 59465.5, "m5": 0 },
+      "priceChange": { "h1": 0.4, "h6": 511459, "h24": 529584 },
+      "liquidity": { "usd": 5000000.0, "base": 105557923, "quote": 20657419 },
+      "fdv": 1274293328217,
+      "marketCap": 1274293328217,
+      "pairCreatedAt": 1784508320000
+    },
+    {
+      "chainId": "solana",
+      "dexId": "raydium",
+      "pairAddress": "3UBestRealUsdcPool",
+      "baseToken": {
+        "address": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+        "name": "Bonk",
+        "symbol": "Bonk"
+      },
+      "quoteToken": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "name": "USD Coin",
+        "symbol": "USDC"
+      },
+      "priceNative": "0.000002943",
+      "priceUsd": "0.000002943",
+      "txns": {
+        "m5": { "buys": 11, "sells": 4 },
+        "h1": { "buys": 402, "sells": 388 },
+        "h6": { "buys": 2100, "sells": 2050 },
+        "h24": { "buys": 8800, "sells": 8100 }
+      },
+      "volume": { "h24": 1250000.5, "h6": 400000.25, "h1": 61234.75, "m5": 980.5 },
+      "priceChange": { "h6": 5.14, "h24": 8.13, "h1": 0.93 },
+      "liquidity": { "usd": 900000.0, "base": 300000000000, "quote": 450000.0 },
+      "fdv": 261658876,
+      "marketCap": 261658876,
+      "pairCreatedAt": 1671980424000
+    }
+  ]
+}

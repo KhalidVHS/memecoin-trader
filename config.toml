@@ -33,7 +33,7 @@ price_cache_read_per_mtok = 0.5
 
 [cadence]
 fast_tick_seconds = 60       # mark the book, enforce stops — no model call
-slow_tick_seconds = 900      # full LLM decision cycle (15 min)
+slow_tick_seconds = 900     # full LLM decision cycle (15 min)
 
 [risk]
 max_position_pct = 0.30      # of total book value
