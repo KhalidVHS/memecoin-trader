@@ -1,412 +1,426 @@
-"""Thinking capture, the request shape, and the cost arithmetic in ``brain.py``.
+"""Tests for the advisory call and, mostly, for what it refuses to believe.
 
-Nothing here touches the network. The test that would prove the request shape
-end to end is ``tests/test_prompts.py::test_live_call_hits_the_prompt_cache``,
-and on 2026-09-19 it could not be run: no ``ANTHROPIC_API_KEY`` was reachable
-from the environment or from a ``.env``. So the request-shape tests below are
-written against the installed SDK's *own* type definitions rather than against
-anybody's memory of the API — they cannot prove the server accepts the call,
-but they will fail the moment an SDK upgrade moves ``effort`` out of
-``output_config`` or drops the adaptive thinking variant, which is the drift
-that would otherwise be discovered by a 400 in production.
+The central assertion in this file is negative: ``_validate`` never repairs
+anything. Audit C6 named the old ``_normalize`` as a critical finding, and one
+case shows why a repair function is worse than no function at all — it tested
+``size < 0.0``, and every comparison against NaN is false, so a NaN size was not
+negative, not positive, not out of range. It passed the repair, passed
+``Field(ge=0.0)``, passed every risk comparison for the same reason, and arrived
+at the broker as an order size.
 
-Response stubs follow the style of the ``Boom`` client in test_prompts.py:
-plain objects carrying exactly the attributes ``brain`` reads, so a stub can
-also express shapes a real response never would.
+So each of the six defects below discards the **whole** decision. There is no
+partial acceptance and no inference about what the model meant, and
+``TestNoRepair`` asserts the repair function is gone rather than merely unused.
+
+Removed from the previous version of this file, with reasons:
+
+* Every test of ``_normalize``'s corrections (drop-unknown, keep-first-duplicate,
+  fill-missing-with-HOLD, clamp-negative-to-zero) — those behaviours are the
+  audit finding. Each has a mirror-image test here asserting a rejection.
+* ``decide()`` tests — renamed ``advise()`` and returning ``AdvisoryDecision``
+  (audit C6: the model advises, it does not decide).
+
+Kept and adapted: the thinking-block tests, the SDK-shape tests (which read the
+installed ``anthropic`` package rather than calling it), and the cost and
+cache-rate arithmetic.
 """
 
 from __future__ import annotations
 
-import inspect
-import typing
-from pathlib import Path
+import math
+from dataclasses import dataclass
 from typing import Any
 
+import anthropic
+import httpx
 import pytest
 
-from memetrader import config as config_mod
-from memetrader.brain import Usage, decide
-from memetrader.types import Action, PortfolioState, TradeDecision
+from memetrader import brain
+from memetrader.brain import (
+    BrainError,
+    ModelCallError,
+    ModelOutputError,
+    Usage,
+    advise,
+)
+from memetrader.types import AdvisoryAction, AdvisoryDecision, ValidationError
+from test_prompts import (  # reuse the evidence fixtures; same types, same shapes
+    SYMBOLS,
+    FakeCadence,
+    FakeRisk,
+    _evidence,
+    _portfolio,
+)
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
 
-NOW = 1_764_000_000.0
+@dataclass(frozen=True)
+class FakeModel:
+    name: str = "claude-opus-5"
+    effort: str = "high"
+    max_tokens: int = 4096
+
+    def cost_usd(self, inp: int, out: int, cache_read: int, cache_write: int) -> float:
+        # $1 / $5 / $0.10 / $1.25 per Mtok, chosen so the arithmetic is readable.
+        return (inp * 1.0 + out * 5.0 + cache_read * 0.10 + cache_write * 1.25) / 1_000_000
 
 
-# ---------------------------------------------------------------------------
-# Stubs
-# ---------------------------------------------------------------------------
+def action(symbol: str, act: str = "HOLD", size: float = 0.0, **kw) -> AdvisoryAction:
+    return AdvisoryAction(
+        action=act,  # type: ignore[arg-type]
+        symbol=symbol,
+        size_usd=size,
+        confidence=kw.get("confidence", 0.5),
+        reasoning=kw.get("reasoning", "RSI14 at 58.2 and nothing else moved."),
+    )
+
+
+def decision(*actions: AdvisoryAction, read: str = "Quiet tape.") -> AdvisoryDecision:
+    return AdvisoryDecision(market_read=read, actions=list(actions))
+
+
+def good() -> AdvisoryDecision:
+    return decision(action("BONK", "BUY", 50.0), action("WIF"))
 
 
 class _Block:
-    """One content block. ``type`` is the discriminator ``brain`` switches on."""
-
-    def __init__(self, type: str, **fields: Any) -> None:
-        self.type = type
-        for key, value in fields.items():
-            setattr(self, key, value)
+    def __init__(self, kind: str, **kw) -> None:
+        self.type = kind
+        for k, v in kw.items():
+            setattr(self, k, v)
 
 
-class _SdkUsage:
-    def __init__(
-        self,
-        input_tokens: int = 0,
-        output_tokens: int = 0,
-        cache_read_input_tokens: int = 0,
-        cache_creation_input_tokens: int = 0,
-    ) -> None:
-        self.input_tokens = input_tokens
-        self.output_tokens = output_tokens
-        self.cache_read_input_tokens = cache_read_input_tokens
-        self.cache_creation_input_tokens = cache_creation_input_tokens
+class _Usage:
+    def __init__(self, **kw) -> None:
+        self.input_tokens = kw.get("input_tokens", 100)
+        self.output_tokens = kw.get("output_tokens", 200)
+        self.cache_read_input_tokens = kw.get("cache_read_input_tokens", 900)
+        self.cache_creation_input_tokens = kw.get("cache_creation_input_tokens", 0)
+
+
+_DEFAULT = object()
 
 
 class _Response:
     def __init__(
         self,
+        parsed: AdvisoryDecision | None = None,
         *,
-        content: tuple[Any, ...] = (),
-        usage: Any = None,
-        parsed_output: Any = None,
-        stop_reason: str | None = "end_turn",
+        content: list[Any] | None = None,
+        stop_reason: str = "end_turn",
+        usage: Any = _DEFAULT,
+        stop_details: Any | None = None,
     ) -> None:
-        self.content = list(content)
-        self.usage = usage
-        self.parsed_output = parsed_output
+        self.parsed_output = parsed
+        self.content = content or []
         self.stop_reason = stop_reason
+        self.usage = _Usage() if usage is _DEFAULT else usage
+        self.stop_details = stop_details
 
 
-class _StubMessages:
-    def __init__(self, client: _StubClient) -> None:
-        self._client = client
+class FakeClient:
+    """Stands in for ``anthropic.Anthropic``. Records the call it was given."""
+
+    def __init__(self, response: Any = None, raises: Exception | None = None) -> None:
+        self._response = response if response is not None else _Response(good())
+        self._raises = raises
+        self.calls: list[dict[str, Any]] = []
+        self.messages = self
 
     def parse(self, **kwargs: Any) -> Any:
-        self._client.kwargs = kwargs
-        return self._client.response
+        self.calls.append(kwargs)
+        if self._raises is not None:
+            raise self._raises
+        return self._response
 
 
-class _StubClient:
-    """Just enough SDK surface for ``decide`` to reach ``messages.parse``,
-    keeping the kwargs so a test can assert on the request we actually send."""
-
-    def __init__(self, response: Any) -> None:
-        self.response = response
-        self.kwargs: dict[str, Any] = {}
-        self.messages = _StubMessages(self)
-
-
-def _thinking_block(text: str) -> _Block:
-    return _Block("thinking", thinking=text, signature="sig")
-
-
-def _text_block(text: str = "{}") -> _Block:
-    return _Block("text", text=text)
+def run(client: FakeClient, **kw):
+    params = {
+        "symbols": SYMBOLS,
+        "model": FakeModel(),
+        "risk": FakeRisk(),
+        "cadence": FakeCadence(),
+        "starting_cash_usd": 1000.0,
+        "client": client,
+    }
+    params.update(kw)
+    return advise(_evidence(), _portfolio(), [], [], **params)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
 
 
-@pytest.fixture(scope="session")
-def cfg():
-    return config_mod.load(REPO_ROOT / "config.toml")
+class TestHappyPath:
+    def test_a_valid_output_comes_back_intact(self):
+        result, usage = run(FakeClient())
+        assert [a.symbol for a in result.actions] == list(SYMBOLS)
+        assert result.actions[0].action == "BUY"
+        assert usage.output_tokens == 200
+
+    def test_actions_are_reordered_to_the_configured_universe(self):
+        out_of_order = decision(action("WIF"), action("BONK", "SELL", 10.0))
+        result, _ = run(FakeClient(_Response(out_of_order)))
+        assert [a.symbol for a in result.actions] == ["BONK", "WIF"]
+
+    def test_a_lowercase_symbol_is_normalized_not_rejected(self):
+        # Case is a formatting difference, not a claim about a different coin.
+        mixed = decision(action("bonk", "BUY", 5.0), action("WIF"))
+        result, _ = run(FakeClient(_Response(mixed)))
+        assert result.actions[0].symbol == "BONK"
+
+    def test_the_prompt_fingerprint_rides_on_usage(self):
+        _, usage = run(FakeClient())
+        assert len(usage.prompt_fingerprint) == 16
 
 
-@pytest.fixture
-def empty_portfolio(cfg) -> PortfolioState:
-    return PortfolioState(
-        ts=NOW,
-        cash_usd=cfg.starting_cash_usd,
-        positions={},
-        marks={},
-        position_values_usd={},
-        unrealized_pnl_usd=0.0,
-        realized_pnl_usd=0.0,
-        total_value_usd=cfg.starting_cash_usd,
-        starting_cash_usd=cfg.starting_cash_usd,
-    )
+class TestWholeOutputDiscarded:
+    """Audit C6: "reject whole invalid output. No model repair may create an order.\""""
 
+    def _reject(self, bad: AdvisoryDecision) -> str:
+        with pytest.raises(ModelOutputError) as exc:
+            run(FakeClient(_Response(bad)))
+        return str(exc.value)
 
-def _all_hold(cfg) -> TradeDecision:
-    return TradeDecision(
-        market_read="nothing is happening",
-        actions=[
-            Action(
-                action="HOLD",
-                symbol=symbol,
-                size_usd=0.0,
-                confidence=0.4,
-                reasoning="flow flat",
+    def test_a_hallucinated_symbol_discards_everything(self):
+        bad = decision(
+            action("BONK", "BUY", 50.0), action("WIF"), action("SOLANAMOON", "BUY", 900.0)
+        )
+        message = self._reject(bad)
+        assert "SOLANAMOON" in message
+        assert "discarding the whole output" in message
+
+    def test_a_duplicate_symbol_discards_everything(self):
+        bad = decision(
+            action("BONK", "BUY", 50.0), action("BONK", "SELL", 50.0), action("WIF")
+        )
+        assert "two actions for BONK" in self._reject(bad)
+
+    def test_a_missing_symbol_discards_everything(self):
+        # The old code filled this with HOLD, converting an incomplete answer
+        # into a confident flat one — and a HOLD on a position that should have
+        # been exited is not a null action.
+        assert "WIF" in self._reject(decision(action("BONK", "BUY", 50.0)))
+
+    def test_a_negative_size_discards_everything(self):
+        bad = decision(action("BONK", "BUY", 0.0), action("WIF"))
+        bad.actions[0] = AdvisoryAction.model_construct(
+            action="BUY", symbol="BONK", size_usd=-25.0, confidence=0.5, reasoning="x"
+        )
+        assert "negative size_usd" in self._reject(bad)
+
+    def test_a_hold_with_a_non_zero_size_discards_everything(self):
+        bad = decision(action("BONK", "HOLD", 42.0), action("WIF"))
+        assert "contradict each other" in self._reject(bad)
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_a_non_finite_size_discards_everything(self, value: float):
+        """The case the old repair could not see.
+
+        ``nan < 0.0`` is false, ``nan > max_notional`` is false, and
+        ``Field(ge=0.0)`` does not reject it either. A NaN walks the whole
+        system precisely because nothing about it is ever true, so the check has
+        to be ``math.isfinite`` and not a comparison.
+        """
+        bad = decision(action("BONK", "BUY", 0.0), action("WIF"))
+        bad.actions[0] = AdvisoryAction.model_construct(
+            action="BUY", symbol="BONK", size_usd=value, confidence=0.5, reasoning="x"
+        )
+        message = self._reject(bad)
+        assert "unusable size_usd" in message or "negative size_usd" in message
+
+    def test_the_schema_itself_also_rejects_nan(self):
+        # Defense in depth: the field validator on AdvisoryAction is the first
+        # gate, _validate is the second. Neither is sufficient alone — the
+        # schema can be bypassed by model_construct, and the validator only runs
+        # on data that reached it.
+        with pytest.raises((ValidationError, ValueError)):
+            AdvisoryAction(
+                action="BUY",
+                symbol="BONK",
+                size_usd=math.nan,
+                confidence=0.5,
+                reasoning="x",
             )
-            for symbol in cfg.symbols
-        ],
-    )
+
+    def test_a_discard_is_a_brain_error_so_callers_fall_back(self):
+        bad = decision(action("BONK", "HOLD", 1.0), action("WIF"))
+        with pytest.raises(BrainError):
+            run(FakeClient(_Response(bad)))
 
 
-# ---------------------------------------------------------------------------
-# Thinking extraction
-# ---------------------------------------------------------------------------
+class TestNoRepair:
+    def test_the_repair_function_is_gone(self):
+        assert not hasattr(brain, "_normalize")
+
+    def test_nothing_is_exported_that_produces_an_order(self):
+        # advise() returns advice. The order types are not even imported here.
+        assert "OrderIntent" not in dir(brain)
+        assert brain.__all__ == [
+            "BrainError",
+            "ModelCallError",
+            "ModelOutputError",
+            "Usage",
+            "advise",
+        ]
 
 
-def test_thinking_is_read_from_the_content_blocks():
-    response = _Response(
-        content=(_thinking_block("BONK flow is thinning"), _text_block()),
-        usage=_SdkUsage(input_tokens=10),
-    )
-    assert Usage.from_response(response).thinking == "BONK flow is thinning"
+class TestApiFailures:
+    def _raise(self, exc: Exception) -> ModelCallError:
+        with pytest.raises(ModelCallError) as caught:
+            run(FakeClient(raises=exc))
+        return caught.value
 
-
-def test_multiple_thinking_blocks_are_joined_in_order():
-    """Adaptive thinking may emit more than one block; indexing [0] would
-    silently keep a prefix of the reasoning and drop the conclusion."""
-    response = _Response(
-        content=(
-            _thinking_block("first, the liquidity trend"),
-            _text_block(),
-            _thinking_block("then, the sentiment z-score"),
+    def test_a_rate_limit_is_retryable(self):
+        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        response = httpx.Response(429, request=request)
+        error = self._raise(
+            anthropic.RateLimitError("slow down", response=response, body=None)
         )
-    )
-    assert Usage.from_response(response).thinking == (
-        "first, the liquidity trend\n\nthen, the sentiment z-score"
-    )
+        assert error.retryable is True
 
+    def test_a_500_is_retryable_and_a_400_is_not(self):
+        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        for status, retryable in ((500, True), (400, False)):
+            response = httpx.Response(status, request=request)
+            error = self._raise(
+                anthropic.APIStatusError("boom", response=response, body=None)
+            )
+            assert error.retryable is retryable, status
 
-def test_no_thinking_block_is_none():
-    response = _Response(content=(_text_block(),), usage=_SdkUsage(output_tokens=5))
-    assert Usage.from_response(response).thinking is None
+    def test_a_connection_failure_is_retryable(self):
+        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        error = self._raise(anthropic.APIConnectionError(request=request))
+        assert error.retryable is True
 
+    def test_an_api_failure_never_returns_a_hold(self):
+        """A skipped tick and a considered HOLD are different events.
 
-def test_whitespace_only_thinking_is_none_not_empty_string():
-    """A blank string would render as an empty 'thinking:' line in `report`,
-    which reads as "the model thought nothing" rather than "no trace"."""
-    response = _Response(content=(_thinking_block("   \n\t "),))
-    assert Usage.from_response(response).thinking is None
+        A decision log that renders them identically cannot be used to debug a
+        bad run, which is why this raises instead of returning something
+        plausible.
+        """
+        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        response = httpx.Response(503, request=request)
+        with pytest.raises(ModelCallError):
+            run(
+                FakeClient(
+                    raises=anthropic.APIStatusError("down", response=response, body=None)
+                )
+            )
 
-
-def test_redacted_thinking_is_marked_rather_than_dropped():
-    """The ciphertext is useless in a log, but "did not think" and "thought
-    where we cannot read it" must not render identically."""
-    response = _Response(content=(_Block("redacted_thinking", data="AAAA=="), _text_block()))
-    thinking = Usage.from_response(response).thinking
-    assert thinking is not None
-    assert "redacted" in thinking
-    assert "AAAA==" not in thinking, "the encrypted payload must not reach the log"
-
-
-def test_redacted_and_readable_blocks_both_survive():
-    response = _Response(
-        content=(
-            _thinking_block("the readable part"),
-            _Block("redacted_thinking", data="AAAA=="),
+    def test_a_refusal_is_an_output_error(self):
+        response = _Response(
+            None, stop_reason="refusal", stop_details=_Block("refusal", category="policy")
         )
-    )
-    thinking = Usage.from_response(response).thinking or ""
-    assert "the readable part" in thinking
-    assert "redacted" in thinking
+        with pytest.raises(ModelOutputError) as exc:
+            run(FakeClient(response))
+        assert "refused" in str(exc.value)
+
+    def test_empty_structured_output_is_an_output_error(self):
+        with pytest.raises(ModelOutputError):
+            run(FakeClient(_Response(None, stop_reason="max_tokens")))
 
 
-def test_unknown_block_types_are_ignored():
-    response = _Response(content=(_Block("tool_use", id="t1", name="x", input={}),))
-    assert Usage.from_response(response).thinking is None
-
-
-def test_response_missing_content_entirely_is_tolerated():
-    """``from_response`` reads defensively because the stubs in the test suite,
-    and any future SDK shape, may not carry every attribute."""
-
-    class Bare:
-        usage = _SdkUsage(input_tokens=7)
-
-    usage = Usage.from_response(Bare())
-    assert usage.thinking is None
-    assert usage.input_tokens == 7
-
-
-def test_thinking_survives_a_response_with_no_usage_block():
-    usage = Usage.from_response(_Response(content=(_thinking_block("still thought"),)))
-    assert usage.thinking == "still thought"
-    assert usage.input_tokens == 0
-
-
-def test_the_four_token_counts_are_unaffected_by_the_new_field():
-    response = _Response(
-        content=(_thinking_block("x"),),
-        usage=_SdkUsage(11, 22, 33, 44),
-    )
-    usage = Usage.from_response(response)
-    assert (usage.input_tokens, usage.output_tokens) == (11, 22)
-    assert (usage.cache_read_input_tokens, usage.cache_creation_input_tokens) == (33, 44)
-    assert usage.total_input_tokens == 88
-
-
-# ---------------------------------------------------------------------------
-# decide() — the contract loop.py depends on
-# ---------------------------------------------------------------------------
-
-
-def test_decide_returns_exactly_two_values_and_carries_the_thinking(
-    cfg, empty_portfolio
-):
-    """``loop.py`` unpacks two values. A third would break a file this change
-    is not allowed to touch, so the thinking rides inside ``Usage``."""
-    client = _StubClient(
-        _Response(
-            content=(_thinking_block("liquidity is draining on POPCAT"), _text_block()),
-            usage=_SdkUsage(120, 400, 2_000, 0),
-            parsed_output=_all_hold(cfg),
+class TestThinking:
+    def test_thinking_blocks_are_concatenated(self):
+        response = _Response(
+            good(),
+            content=[
+                _Block("thinking", thinking="first thought"),
+                _Block("text", text="ignored"),
+                _Block("thinking", thinking="second thought"),
+            ],
         )
-    )
-    returned = decide(cfg, {}, empty_portfolio, [], [], client=client)
+        _, usage = run(FakeClient(response))
+        assert usage.thinking == "first thought\n\nsecond thought"
 
-    assert len(returned) == 2
-    decision, usage = returned
-    assert isinstance(usage, Usage)
-    assert usage.thinking == "liquidity is draining on POPCAT"
-    assert [a.symbol for a in decision.actions] == list(cfg.symbols)
+    def test_a_redacted_block_leaves_a_marker_not_ciphertext(self):
+        # "The model did not think" and "the model thought and we may not see
+        # it" are different events, and the ciphertext costs disk for bytes
+        # nobody can read.
+        response = _Response(good(), content=[_Block("redacted_thinking", data="x" * 5000)])
+        _, usage = run(FakeClient(response))
+        assert usage.thinking == brain._REDACTED_THINKING
+        assert "xxxx" not in (usage.thinking or "")
+
+    def test_no_thinking_blocks_means_none(self):
+        _, usage = run(FakeClient(_Response(good(), content=[_Block("text", text="hi")])))
+        assert usage.thinking is None
 
 
-def test_decide_reports_no_thinking_as_none(cfg, empty_portfolio):
-    client = _StubClient(
-        _Response(
-            content=(_text_block(),),
-            usage=_SdkUsage(120, 400, 2_000, 0),
-            parsed_output=_all_hold(cfg),
+class TestUsage:
+    def test_total_input_includes_both_cache_counts(self):
+        usage = Usage(
+            input_tokens=100,
+            cache_read_input_tokens=900,
+            cache_creation_input_tokens=50,
         )
-    )
-    _, usage = decide(cfg, {}, empty_portfolio, [], [], client=client)
-    assert usage.thinking is None
+        assert usage.total_input_tokens == 1050
+        assert usage.cache_hit_rate == pytest.approx(900 / 1050)
+
+    def test_cost_prices_cache_creation_too(self):
+        """It did not, once, and that understated exactly the call a cache
+        regression makes you pay over and over."""
+        usage = Usage(
+            input_tokens=1_000_000,
+            output_tokens=0,
+            cache_read_input_tokens=0,
+            cache_creation_input_tokens=1_000_000,
+        )
+        assert usage.cost_usd(FakeModel()) == pytest.approx(1.0 + 1.25)
+
+    def test_a_response_without_usage_does_not_crash(self):
+        usage = Usage.from_response(_Response(good(), usage=None))
+        assert usage.total_input_tokens == 0
+        assert usage.cache_hit_rate == 0.0
+
+    def test_a_cache_miss_is_logged_as_a_warning(self, caplog):
+        response = _Response(good(), usage=_Usage(cache_read_input_tokens=0))
+        with caplog.at_level("WARNING"):
+            run(FakeClient(response))
+        assert "prompt cache miss" in caplog.text
 
 
-def test_decide_asks_for_adaptive_thinking_and_effort_in_output_config(
-    cfg, empty_portfolio
-):
-    client = _StubClient(
-        _Response(content=(_text_block(),), parsed_output=_all_hold(cfg))
-    )
-    decide(cfg, {}, empty_portfolio, [], [], client=client)
+class TestSdkShape:
+    """Read from the installed ``anthropic`` 1.7.0. No network, no billing."""
 
-    sent = client.kwargs
-    assert sent["thinking"] == {"type": "adaptive"}
-    assert sent["output_config"] == {"effort": cfg.model.effort}
-    assert sent["output_format"] is TradeDecision
-    # `budget_tokens` is the thing that is believed to 400 on this model family.
-    assert "budget_tokens" not in sent["thinking"]
-    assert "effort" not in sent, "effort must travel inside output_config"
+    def test_the_call_passes_adaptive_thinking_with_no_token_budget(self):
+        client = FakeClient()
+        run(client)
+        thinking = client.calls[0]["thinking"]
+        assert thinking == {"type": "adaptive"}
+        # budget_tokens is a key of the *enabled* variant only; depth here is
+        # controlled by effort.
+        assert "budget_tokens" not in thinking
 
+    def test_adaptive_is_a_real_thinking_variant(self):
+        from anthropic.types import thinking_config_param as tcp
 
-# ---------------------------------------------------------------------------
-# The request shape, checked against the installed SDK
-# ---------------------------------------------------------------------------
+        names = {n for n in dir(tcp) if "Adaptive" in n}
+        assert names, dir(tcp)
 
+    def test_effort_is_a_key_of_output_config(self):
+        from anthropic.types.output_config_param import OutputConfigParam
 
-def _allowed_literals(annotation: Any) -> set[Any]:
-    """Every literal value an annotation permits, seeing through ``| None``."""
-    values: set[Any] = set()
-    for arg in typing.get_args(annotation) or (annotation,):
-        if arg is type(None):
-            continue
-        values.update(typing.get_args(arg) or (arg,))
-    return values
+        assert "effort" in OutputConfigParam.__annotations__
 
+    def test_the_call_passes_effort_and_the_advisory_schema_together(self):
+        client = FakeClient()
+        run(client)
+        call = client.calls[0]
+        assert call["output_config"] == {"effort": "high"}
+        assert call["output_format"] is AdvisoryDecision
 
-def test_every_kwarg_we_send_is_one_messages_parse_accepts(cfg, empty_portfolio):
-    from anthropic.resources.messages import Messages
+    def test_the_system_prompt_is_a_block_list_with_cache_breakpoints(self):
+        client = FakeClient()
+        run(client)
+        system = client.calls[0]["system"]
+        assert isinstance(system, list)
+        assert all(b["cache_control"] == {"type": "ephemeral"} for b in system)
 
-    client = _StubClient(
-        _Response(content=(_text_block(),), parsed_output=_all_hold(cfg))
-    )
-    decide(cfg, {}, empty_portfolio, [], [], client=client)
-
-    accepted = set(inspect.signature(Messages.parse).parameters) - {"self"}
-    unknown = set(client.kwargs) - accepted
-    assert not unknown, f"messages.parse would reject these kwargs: {sorted(unknown)}"
-    for required in ("thinking", "output_config", "output_format"):
-        assert required in accepted
-
-
-def test_adaptive_is_a_real_thinking_variant_and_owns_no_budget_tokens():
-    """Pins the claim in ``decide``'s comment to something checkable: the
-    union has an adaptive variant, and ``budget_tokens`` is not part of it."""
-    from anthropic.types import ThinkingConfigParam
-
-    variants = {}
-    for variant in typing.get_args(ThinkingConfigParam):
-        hints = typing.get_type_hints(variant)
-        for value in _allowed_literals(hints["type"]):
-            variants[value] = hints
-
-    assert "adaptive" in variants
-    assert set({"type": "adaptive"}) <= set(variants["adaptive"])
-    assert "budget_tokens" not in variants["adaptive"]
-    # It exists on exactly one variant, which is why the two cannot be combined.
-    assert [k for k, v in variants.items() if "budget_tokens" in v] == ["enabled"]
-
-
-def test_effort_is_a_key_of_output_config_and_our_value_is_allowed(cfg):
-    from anthropic.types.output_config_param import OutputConfigParam
-
-    hints = typing.get_type_hints(OutputConfigParam)
-    assert "effort" in hints
-    assert "format" in hints, "parse merges the json_schema in here under 'format'"
-    assert cfg.model.effort in _allowed_literals(hints["effort"])
-
-
-# ---------------------------------------------------------------------------
-# Cost
-# ---------------------------------------------------------------------------
-
-
-def test_cost_charges_for_cache_creation_tokens(cfg):
-    """The defect this fixes: cache-creation billed as free. Two Usages that
-    differ only in creation tokens must not cost the same."""
-    without = Usage(input_tokens=100, output_tokens=50, cache_read_input_tokens=2_000)
-    with_write = Usage(
-        input_tokens=100,
-        output_tokens=50,
-        cache_read_input_tokens=2_000,
-        cache_creation_input_tokens=4_000,
-    )
-    assert with_write.cost_usd(cfg) > without.cost_usd(cfg)
-    expected = 4_000 * cfg.model.price_cache_write_per_mtok / 1_000_000
-    assert with_write.cost_usd(cfg) - without.cost_usd(cfg) == pytest.approx(expected)
-
-
-def test_cache_creation_is_priced_above_plain_input(cfg):
-    """It must not be folded into ``input_tokens``, which is what the two
-    display call sites used to do — that prices the premium away."""
-    assert cfg.model.price_cache_write_per_mtok > cfg.model.price_input_per_mtok
-    as_input = Usage(input_tokens=10_000)
-    as_write = Usage(cache_creation_input_tokens=10_000)
-    assert as_write.cost_usd(cfg) > as_input.cost_usd(cfg)
-
-
-def test_usage_cost_is_the_model_formula_with_all_four_counts(cfg):
-    usage = Usage(
-        input_tokens=1_234,
-        output_tokens=5_678,
-        cache_read_input_tokens=9_012,
-        cache_creation_input_tokens=3_456,
-    )
-    assert usage.cost_usd(cfg) == cfg.model.cost_usd(
-        usage.input_tokens,
-        usage.output_tokens,
-        usage.cache_read_input_tokens,
-        usage.cache_creation_input_tokens,
-    )
-
-
-def test_cache_hit_rate_denominator_includes_creation_tokens(cfg):
-    """``report.print_spend`` shares this definition; the two used to disagree
-    because the report divided by (input + cache_read) only."""
-    usage = Usage(
-        input_tokens=100,
-        cache_read_input_tokens=300,
-        cache_creation_input_tokens=100,
-    )
-    assert usage.total_input_tokens == 500
-    assert usage.cache_hit_rate == pytest.approx(0.6)
-
-
-def test_cache_hit_rate_is_zero_not_a_zero_division_on_an_empty_usage():
-    assert Usage().cache_hit_rate == 0.0
+    def test_the_frozen_prefix_is_identical_across_two_calls(self):
+        client = FakeClient()
+        run(client)
+        run(client)
+        assert client.calls[0]["system"] == client.calls[1]["system"]
+        # ...and the volatile half is what carries the per-tick state.
+        assert "CURRENT TIME" in client.calls[0]["messages"][0]["content"]

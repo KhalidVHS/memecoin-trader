@@ -1,75 +1,99 @@
-"""Reddit *attention*, not Reddit sentiment.
+"""Reddit *attention*, as counts only — and, after the audit, off by default.
 
-For memecoins, polarity is manufactured. A shill farm will produce bullish text
-on demand and for a few dollars, which makes "73% of posts are positive" a
-number with no information in it. What survives scrutiny is:
+Two findings shaped every line below.
 
-* **velocity** — is attention accelerating right now (``1h`` rate vs the ``24h``
-  baseline rate; the model reads the *ratio*),
+**Audit C7 (security blocker).** The old module collected raw submission and
+comment text into ``SentimentBrief.top_posts`` and ``prompts.py`` interpolated
+it verbatim into the same prompt that had order authority. Any member of the
+public could write a Reddit comment addressed to the trader and have it read as
+instructions by a model that could place orders. That is textbook indirect
+prompt injection in a capital-allocation loop.
+
+The fix is deletion, not escaping. There is no escaping scheme that reliably
+separates data from instructions inside one natural-language context, and the
+vendor guidance says so plainly. So:
+
+* ``SentimentBrief`` no longer has an excerpt field and ``TopPost`` no longer
+  exists — the *collection* path is gone, not merely the rendering path;
+* what survives is **counts and rates**, which are numbers and cannot issue
+  instructions;
+* post text exists only inside one tick, only as the input to the alias matcher
+  (:func:`matching_posts`), and :class:`Post` redacts it from its own ``repr``
+  so a stray log line or traceback cannot leak it either;
+* no text extractor is implemented. §8 of the audit permits an isolated,
+  schema-constrained extractor whose output is structured values only; it also
+  requires an adversarial corpus and a locked ablation before such a feature may
+  influence anything. Neither exists, so the honest implementation is none.
+
+**Audit §7/§11 (correctness).** The stream is **disabled by default**
+(``SentimentSettings.enabled``, wired from ``[sentiment] enabled``) pending the
+ablation the audit specifies: *does this feed improve net out-of-sample Sharpe,
+expectancy and drawdown at the intended capacity, after its latency and cost?*
+Until that question has an answer, this is an experiment source, not a
+production input.
+
+**Attention, not polarity.** For memecoins, polarity is manufactured: a shill
+farm produces bullish text on demand for a few dollars, which makes "73% of
+posts are positive" a number with no information in it. The old
+``keyword_polarity`` — a twelve-line lexicon with no negation, sarcasm or
+multilingual handling — is deleted outright (audit §7: "Absolute keyword
+polarity — REMOVE"), and the ``polarity`` field is gone from the type. What
+survives scrutiny, and what is still worth *researching*:
+
+* **velocity** — is attention accelerating right now,
 * **breadth** — how many distinct humans, versus one account posting forty
   times (``contributor_to_post_ratio``, the shill-farm detector),
 * **novelty** — is this level of attention unusual *for this coin*
-  (``mention_zscore_7d``).
+  (``mention_zscore_7d``), now measured against a strictly non-overlapping
+  baseline.
 
-So this module counts posts and counts people. ``polarity`` exists, is a
-twelve-line keyword lexicon with no dependencies, and is flagged low-trust in
-the prompt. There is deliberately no classifier and no ``transformers``.
-
-Two sources, one shape:
-
-``ArcticShiftProvider``
-    Keyless community mirror of the Reddit archive. Always available, needs no
-    credentials, and is therefore the path that can never be blocked on the
-    user creating an OAuth app.
-``PrawProvider``
-    The official API. Preferred when ``cfg.sentiment.has_reddit_credentials``
-    is true, because it is authoritative and fresher.
-
-**Failure policy.** ``brief()`` returns ``None`` on total failure and never
-raises. A missing sentiment brief is rendered to the model as *explicitly
-unavailable* so it can discount its own confidence; a sentiment outage must
-never fail a tick, and must never silently look like "nobody is talking about
-this". Those are different claims and the type system keeps them apart:
+**Failure policy.** :func:`brief` returns ``None`` on total failure and never
+raises. A missing brief is rendered to the model as explicitly unavailable; a
+sentiment outage must never fail a tick, and must never look like "nobody is
+talking about this". Those are different claims and the types keep them apart:
 ``None`` means we could not find out, a brief with ``mention_velocity_1h == 0``
 means we looked and it is quiet.
 
-That rule applies to *every* count, not just the one it was first written for.
-``build_brief``'s ``sweep_size`` is what carries it: a sweep that came back
-empty produces ``None`` for both velocities, no z-score and no contributor
-count, because zero posts read from five subreddits cannot distinguish silence
-from a failed read. Every field on ``SentimentBrief`` that reports a quantity is
-now optional for that reason, so no consumer can be handed a fabricated zero.
+**Missing is never zero.** Every count here is ``X | None``. ``build_brief``'s
+``sweep_size`` carries the rule: a sweep that came back empty produces ``None``
+for both velocities, no z-score and no contributor count, because zero posts
+read from five subreddits cannot distinguish silence from a failed read.
 
-**On the size of a zero.** Attention on these coins is sparse enough that a
-zero usually means very little. Across the five configured subreddits, the
-whole 90 days ending 2026-09-19 held 23 BONK submissions, 3 popcat and 1
-dogwifhat, with the newest BONK submission 14.7 days old — about 0.26 BONK
-posts a day, and a tenth of that for the other two. A 24-hour window with no
-mentions is therefore the ordinary outcome rather than a signal, so a brief
-reporting one says how many items it swept to get there.
+**On the size of a zero.** Attention on these coins is sparse enough that a zero
+usually means very little. Across the five configured subreddits, the whole 90
+days ending 2026-09-19 held 23 BONK submissions, 3 popcat and 1 dogwifhat, with
+the newest BONK submission 14.7 days old — about 0.26 BONK posts a day, and a
+tenth of that for the other two. A 24-hour window with no mentions is the
+ordinary outcome rather than a signal, so a brief reporting one says how many
+items it swept to get there.
 
-**Comments are swept alongside submissions** (``sentiment.include_comments``,
-default on) because that is where the chatter actually is. Measured across the
-five configured subreddits for the 24h ending 2026-09-20 00:13 UTC: 136
-submissions against at least 1008 comments, a 7.4:1 ratio, and 103 unique
-authors against 498. Be honest about what that buys, though — over the same
-window the alias matcher found 0 BONK / 0 WIF / 0 POPCAT mentions in
-submissions and 1 / 0 / 0 in comments. It is a 7.4x larger *denominator* and a
-0 → 1 change in the numerator, not a 7.4x increase in signal. The value is that
-it makes a reported zero mean something: 1008 items read and none of them
-mentioned the coin is a measurement, 136 is barely a sample.
+**Comments are swept alongside submissions** (``include_comments``, default on)
+because that is where the chatter is. Measured across the five configured
+subreddits for the 24h ending 2026-09-20 00:13 UTC: 136 submissions against at
+least 1008 comments, a 7.4:1 ratio, and 103 unique authors against 498. Be
+honest about what that buys: over the same window the alias matcher found
+0 BONK / 0 WIF / 0 POPCAT mentions in submissions and 1 / 0 / 0 in comments. It
+is a 7.4x larger *denominator* and a 0 -> 1 change in the numerator, not a 7.4x
+increase in signal. The value is that it makes a reported zero mean something.
 
-**On Reddit's Data API terms.** §3.2 prohibits deriving revenue from use of the
-API and there is a 48-hour deletion recommendation for stored user content.
-Both are aimed at resellers and are invisible at personal-research scale, but
-they shape the design here: the on-disk cache holds **derived counts,
+**On Reddit's Data API terms and on privacy.** §3.2 prohibits deriving revenue
+from use of the API and there is a 48-hour deletion recommendation for stored
+user content. Both are aimed at resellers and are invisible at personal-research
+scale, but they shape the design: the on-disk cache holds **derived counts,
 timestamps and salted author hashes only** — never post bodies, never comment
 bodies, never post titles, never plaintext usernames. A comment body is user
-content on exactly the same terms as a submission; adding comments to the sweep
-changed nothing about that rule. The three ``top_posts`` titles exist in
-memory for the current tick and are handed straight to the prompt; they are not
-persisted, which is why a cache *hit* returns a brief with an empty
-``top_posts`` and says so in ``degraded_reason``.
+content on exactly the same terms as a submission. Since ``top_posts`` is gone,
+nothing text-shaped reaches the cache by any path at all, and
+``_CACHE_FIELDS`` makes that an allowlist rather than a promise.
+
+The author hash is now **keyed** (audit §15: the docstring claimed salted, the
+code used a bare BLAKE2b digest). A bare digest of a short username is trivially
+reversed by enumerating the handful of accounts that post about a coin, so it is
+pseudonymization in name only. The key comes from configuration or, failing
+that, from :func:`os.urandom` at import time: contributor hashes are compared
+only within a single sweep, so a per-process key costs nothing and guarantees a
+digest cannot be reproduced — by us or by anyone reading a crash dump — without
+the key.
 """
 
 from __future__ import annotations
@@ -78,17 +102,18 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
 import time
-from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal, Protocol, runtime_checkable
 
 import httpx
 
-from .config import CoinConfig, Config, SentimentConfig
 from .http import make_client
-from .types import SentimentBrief, TopPost
+from .types import SentimentBrief
 
 log = logging.getLogger(__name__)
 
@@ -102,7 +127,11 @@ ARCTIC_SHIFT_BASE = "https://arctic-shift.photon-reddit.com/api"
 # (400 "'permalink' is not a valid field"), so this list is exactly what the
 # endpoint will return. Asking for a subset keeps a 24h page of r/CryptoCurrency
 # at ~9 KB instead of ~250 KB.
-_ARCTIC_FIELDS = "id,created_utc,author,title,score,subreddit,num_comments,selftext"
+#
+# ``score`` and ``num_comments`` were dropped when ``top_posts`` was deleted for
+# audit C7: they existed only to rank excerpts for the prompt, and a field we do
+# not use is a field that can end up rendered by accident.
+_ARCTIC_FIELDS = "id,created_utc,author,title,selftext,subreddit"
 
 # ``GET /api/comments/search`` has the *same envelope* as /posts/search and a
 # *different* field whitelist. Verified live 2026-09-19 by probing each name on
@@ -118,12 +147,7 @@ _ARCTIC_FIELDS = "id,created_utc,author,title,score,subreddit,num_comments,selft
 # on this one. Sharing a single constant would not degrade the comment sweep,
 # it would take the endpoint down entirely, for every subreddit, silently
 # (every request raises, every subreddit lands in ``failures``).
-#
-# ``link_id`` is requested but unused today. It is the cheapest field that
-# makes a comment traceable back to its submission, and ``parent_id ==
-# link_id`` is how you tell a top-level comment from a reply — kept because
-# dropping it costs nothing and re-adding it costs a live probe.
-_ARCTIC_COMMENT_FIELDS = "id,created_utc,author,body,score,subreddit,link_id"
+_ARCTIC_COMMENT_FIELDS = "id,created_utc,author,body,subreddit"
 
 # Verified live: 400 "'limit' must be between 1 and 100".
 _ARCTIC_MAX_LIMIT = 100
@@ -159,19 +183,17 @@ _ARCTIC_MAX_PAGES = 6
 # with ``after=-24h before=-21.8h`` 422s, while ``before=-12h`` on the same
 # subreddit returns 200.
 #
-# The consequence is the part that matters, and it is a permanent one: **no
-# page budget completes a 24h comment walk of a busy subreddit.** The older
-# pages are not slow, they are unreachable. So this module does not engineer
-# around the 422 — it stops the walk, records how much of the window it
-# actually covered, and reports the shortfall in ``degraded_reason`` so a low
-# comment count cannot be mistaken for a quiet subreddit.
+# The consequence is permanent: **no page budget completes a 24h comment walk of
+# a busy subreddit.** The older pages are not slow, they are unreachable. So
+# this module does not engineer around the 422 — it stops the walk, records how
+# much of the window it actually covered, and reports the shortfall in
+# ``degraded_reason`` so a low comment count cannot be mistaken for a quiet
+# subreddit.
 _ARCTIC_SPACING_S = 0.6
 
 # Ceiling on one ``/new`` sweep. Reddit pages listings 100 at a time and caps
 # pagination at 1000, so this is 5 requests per subreddit worst case, against a
-# 100 req/min budget. It only binds on a subreddit posting faster than
-# _PRAW_NEW_LIMIT per lookback window — r/CryptoCurrency runs a few hundred a
-# day, so the window closes first and the sweep stops early.
+# 100 req/min budget.
 _PRAW_NEW_LIMIT = 500
 
 # Ceiling on one ``/r/<sub>/comments/`` sweep. Checked against the installed
@@ -182,12 +204,6 @@ _PRAW_NEW_LIMIT = 500
 # ``reddit.subreddit(name).comments(limit=N)``. Its ``_path`` is
 # ``/r/<sub>/comments/`` — a **listing, not a search**, so every reason this
 # module prefers ``/new`` over ``search()`` carries over unchanged.
-#
-# 1000 is Reddit's own pagination ceiling, so this is "as deep as the listing
-# goes", 10 requests per subreddit. A busy subreddit still outruns it — at the
-# measured ≥700 comments/24h for r/CryptoCurrency there is headroom, but not a
-# lot — so the sweep reports when it stopped on the limit rather than on the
-# window edge.
 _PRAW_COMMENT_LIMIT = 1000
 
 # Consecutive out-of-window posts required before a ``/new`` sweep concludes it
@@ -198,56 +214,188 @@ _PRAW_COMMENT_LIMIT = 1000
 _PRAW_STALE_RUN = 3
 
 # How long one subreddit sweep is reused across coins within a single tick.
-# Every coin in a tick shares the same lookback window, so re-pulling it per
-# coin would triple the request count against a host that already rate-limits.
 _MEMO_SECONDS = 60.0
 
 CACHE_FILENAME = "sentiment_cache.json"
 
-# 2 (2026-09-19): comments joined the sweep, so an hourly bucket counts a
-# different thing than it did under version 1 and the two cannot share a
-# baseline — mixing them would show every coin's attention "rising" by exactly
-# the amount the denominator grew. Bumping discards the v1 file wholesale,
-# which also clears the fabricated-zero buckets a pre-``sweep_size`` run left
-# behind (the checked-in cache held 15 zero buckets per coin and
-# ``unique_contributors_24h: 0`` from a sweep that read nothing).
+# 3 (2026-09-20): audit C7. Version 2 entries were written by code that also
+# held excerpt text in memory and whose author hashes were unkeyed; the counts
+# themselves are still sound, but the file format changed (``observed_through``
+# and ``baseline_hours`` arrived, ``polarity`` left) and a v2 file rehydrated
+# through the v3 reader would carry a ``polarity`` key nothing reads. Bumping
+# discards it wholesale.
 #
-# The version alone is too blunt for what happens *after* the upgrade, though:
-# toggling ``include_comments`` changes the unit again, and a global bump would
-# throw away every symbol's history to fix one. So each symbol's entry also
-# carries the unit its buckets were counted in — see ``_baseline_unit``.
-CACHE_VERSION = 2
+# Version 2 (2026-09-19) was the comments bump: an hourly bucket counts a
+# different thing with comments enabled than without, and mixing them would show
+# every coin's attention "rising" by exactly the amount the denominator grew.
+# The version alone is too blunt for what happens *after* an upgrade, though, so
+# each symbol's entry also carries the unit its buckets were counted in — see
+# ``_baseline_unit``.
+CACHE_VERSION = 3
 
 # How far a source's index may trail live before the most recent hour stops
 # being reportable. Measured against the newest post in the whole sweep, not
 # the per-coin matches — a coin with no mentions tells you nothing about
-# freshness. Arctic Shift's lag is *variable*, which is the part that makes
-# measuring it per tick necessary: ~10h behind on 2026-09-18, but 0.01h on a
-# re-check the next day (newest indexed post 22 seconds old). Neither state can
-# be assumed. PRAW queries live Reddit and never trips it. 15 minutes is one
-# slow tick: a lag under that cannot hide a burst from the next decision.
+# freshness. Arctic Shift's lag is *variable*, which is what makes measuring it
+# per tick necessary: ~10h behind on 2026-09-18, but 0.01h on a re-check the
+# next day (newest indexed post 22 seconds old). Neither state can be assumed.
+# PRAW queries live Reddit and never trips it. 15 minutes is one slow tick: a
+# lag under that cannot hide a burst from the next decision.
 _MAX_INDEX_LAG_SECONDS = 900.0
 
 # Bots and tombstones are not contributors. Compared case-insensitively.
 _NON_CONTRIBUTORS = frozenset({"[deleted]", "[removed]", "automoderator", "none", ""})
 
-# How many completed hourly buckets we insist on before we will emit a z-score.
-# One fetch observes ``lookback_hours`` (24) buckets at once, so this is reached
-# on the second day of running. Below it we return ``None`` and say why rather
-# than inventing a number out of one day of history.
+# How many completed, non-overlapping hourly buckets we insist on before we will
+# emit a z-score. One fetch observes ``lookback_hours`` (24) buckets at once, so
+# this is reached on the second day of running. Below it we return ``None`` and
+# say why rather than inventing a number out of one day of history.
 MIN_BASELINE_HOURS = 48
 
-# Titles are handed to the model verbatim; cap them so one pathological title
-# cannot dominate the prompt budget.
-_TITLE_MAX_CHARS = 200
-
-_TOP_POSTS = 3
-
 _SECONDS_PER_HOUR = 3600.0
+
+#: Every key the on-disk cache is permitted to hold for a symbol's brief. An
+#: allowlist rather than a denylist on purpose: audit C7 was a text field that
+#: nobody remembered was text, and a serializer that copies whatever the type
+#: happens to carry will re-acquire that bug the next time the type grows a
+#: field. ``_brief_to_cache`` builds exactly these keys and
+#: ``tests/test_sentiment.py`` asserts every persisted value is a number, a
+#: short reason string, or null.
+_CACHE_FIELDS = (
+    "symbol",
+    "ts",
+    "source",
+    "mention_velocity_1h",
+    "mention_velocity_24h",
+    "mention_zscore_7d",
+    "unique_contributors_24h",
+    "contributor_to_post_ratio",
+    "observed_through",
+    "baseline_hours",
+    "degraded_reason",
+)
 
 
 class SourceUnavailable(RuntimeError):
     """Every configured source failed. Caught by ``brief()``, becomes ``None``."""
+
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+
+def _fresh_author_key() -> bytes:
+    """A per-process key for the contributor hash.
+
+    Contributor hashes are only ever compared *within one sweep* — the question
+    is "is this the same person as that other post", never "who". So a key that
+    changes every process is not a limitation, it is the strongest available
+    guarantee: yesterday's digests cannot be linked to today's even by us.
+
+    A configured key is still supported, because a future coordination feature
+    (e.g. author concentration measured across days) would need one, and because
+    reproducing a run's contributor counts exactly requires it.
+    """
+    return os.urandom(32)
+
+
+@dataclass(frozen=True, slots=True)
+class SentimentSettings:
+    """Everything this module needs, passed explicitly rather than read from a
+    global ``Config``.
+
+    ``enabled`` defaults to **False**. Audit §7's verdict on the social pipeline
+    is that it must leave the production-critical path until a locked ablation
+    answers whether it improves net out-of-sample performance after its latency
+    and cost. A default of ``True`` would make "we never got round to the
+    ablation" indistinguishable from "the ablation passed".
+    """
+
+    data_dir: Path
+    enabled: bool = False
+    cache_ttl_seconds: int = 600
+    lookback_hours: int = 24
+    baseline_days: int = 7
+    subreddits: tuple[str, ...] = ()
+    include_comments: bool = True
+    reddit_client_id: str | None = None
+    reddit_client_secret: str | None = None
+    reddit_user_agent: str = "memetrader/0.1 (paper trading research)"
+    http_timeout_seconds: float = 30.0
+    #: Key for the contributor hash. Never logged, never persisted. Empty is not
+    #: permitted to mean "unkeyed" — ``author_key`` substitutes a random one.
+    author_hash_key: bytes = field(default=b"", repr=False)
+
+    @property
+    def has_reddit_credentials(self) -> bool:
+        return bool(self.reddit_client_id and self.reddit_client_secret)
+
+    @property
+    def author_key(self) -> bytes:
+        """The key actually used for hashing. Never empty.
+
+        blake2b caps its key at 64 bytes and raises above that, which would fail
+        a trading tick over a configuration typo, so a long key is truncated
+        rather than rejected — 64 bytes is far past the point where the extra
+        entropy is doing anything.
+        """
+        return (self.author_hash_key or _PROCESS_AUTHOR_KEY)[:64]
+
+    @classmethod
+    def from_config(cls, cfg: Any) -> SentimentSettings:
+        """Adapt a loaded ``Config``. Every key is read through ``getattr`` with
+        the default stated here, so this module compiles and runs against a
+        ``config.py`` that has not yet grown the new keys — and so the defaults
+        that matter for safety (``enabled``) are *ours* rather than whatever a
+        stale TOML file happens to say.
+        """
+        s = getattr(cfg, "sentiment", None)
+        data = getattr(cfg, "data", None)
+        key = getattr(s, "author_hash_key", None) or os.environ.get(
+            "MEMETRADER_AUTHOR_HASH_KEY", ""
+        )
+        return cls(
+            data_dir=Path(getattr(cfg, "data_dir", Path("data"))),
+            enabled=bool(getattr(s, "enabled", False)),
+            cache_ttl_seconds=int(getattr(s, "cache_ttl_seconds", 600)),
+            lookback_hours=int(getattr(s, "lookback_hours", 24)),
+            baseline_days=int(getattr(s, "baseline_days", 7)),
+            subreddits=tuple(getattr(s, "subreddits", ()) or ()),
+            include_comments=bool(getattr(s, "include_comments", True)),
+            reddit_client_id=getattr(s, "reddit_client_id", None),
+            reddit_client_secret=getattr(s, "reddit_client_secret", None),
+            reddit_user_agent=str(
+                getattr(s, "reddit_user_agent", None)
+                or "memetrader/0.1 (paper trading research)"
+            ),
+            http_timeout_seconds=max(
+                float(getattr(data, "http_timeout_seconds", 15.0) or 15.0), 30.0
+            ),
+            author_hash_key=key.encode("utf-8") if isinstance(key, str) else bytes(key),
+        )
+
+
+#: Generated once at import. See ``_fresh_author_key``.
+_PROCESS_AUTHOR_KEY = _fresh_author_key()
+
+
+class CoinLike(Protocol):
+    """What this module needs from a coin: a symbol and its aliases.
+
+    Deliberately structural. ``config.CoinConfig`` satisfies it, and so does a
+    two-field test fixture, which keeps the sentiment tests from depending on
+    the whole config loader.
+    """
+
+    # Read-only properties rather than mutable attributes: the things that
+    # satisfy this are frozen dataclasses, and a Protocol declaring a settable
+    # attribute is not satisfied by one.
+    @property
+    def symbol(self) -> str: ...
+
+    @property
+    def aliases(self) -> tuple[str, ...]: ...
 
 
 # ---------------------------------------------------------------------------
@@ -258,33 +406,33 @@ class SourceUnavailable(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class Post:
     """One submission **or comment**, normalized out of whichever vendor shape
-    produced it.
+    produced it. Untrusted input, held for one tick.
 
-    Exists for the duration of one tick and is never serialized. ``created_utc``
-    is epoch **seconds** (both sources already use seconds; nothing here divides
-    by 1000).
+    Exists solely as the input to :func:`matching_posts` and is never
+    serialized, never rendered, and never handed to a model. ``created_utc`` is
+    epoch **seconds** (both sources already use seconds; nothing here divides by
+    1000).
 
-    A comment carries ``title=""`` and its body in ``body``, so ``text`` and
-    therefore ``matching_posts`` keep working untouched. The alternative —
-    synthesizing a title like ``"[comment] ..."`` — was considered and rejected:
-    it lies in the type, and ``report.py`` and the prompt would both print the
-    lie. ``kind`` is what consumers use to render the difference, and it is
-    **trailing and defaulted** on purpose, because callers (tests especially)
-    construct ``Post`` positionally.
+    ``text`` is the title and body concatenated, because after audit C7 nothing
+    downstream distinguishes them — a title is user-authored text exactly as a
+    comment body is, and keeping them as separate fields was how one of them
+    ended up rendered into a prompt with order authority. ``text`` and
+    ``author`` are excluded from ``repr`` so that a log line, a ``pytest``
+    assertion dump or a traceback frame cannot leak a post body or a username;
+    that is the one path by which untrusted text could still reach a place it
+    does not belong.
+
+    ``kind`` is what consumers use to tell a submission from a comment, and it
+    is trailing and defaulted because callers (tests especially) construct
+    ``Post`` positionally.
     """
 
     id: str
     created_utc: float
-    author: str
-    title: str
-    body: str
-    score: int
-    subreddit: str
+    author: str = field(repr=False)
+    text: str = field(repr=False)
+    subreddit: str = ""
     kind: Literal["submission", "comment"] = "submission"
-
-    @property
-    def text(self) -> str:
-        return f"{self.title}\n{self.body}"
 
     def age_hours(self, now: float) -> float:
         return max(0.0, (now - self.created_utc) / _SECONDS_PER_HOUR)
@@ -311,11 +459,14 @@ def alias_pattern(aliases: Iterable[str]) -> re.Pattern[str]:
     What this still lets through, honestly:
 
     * **Genuine homonyms.** "WIF" is also *Wallet Import Format* in Bitcoin
-      contexts, and "popcat" is a meme that predates the token. Neither is
-      distinguishable from the ticker without reading the post. A real hit from
+      contexts, and "popcat" is a meme that predates the token. A real hit from
       r/pumpfun during development: *"Imagine yourself being an ALIEN WIF HAT"*
-      — "wif" as eye-dialect for "with". This is why ``top_posts`` is handed to
-      the model raw: it can see that the mention is noise, and we cannot.
+      — "wif" as eye-dialect for "with". This used to be the argument for
+      handing the model the raw text so it could judge the mention itself. It is
+      no longer available as an argument (audit C7), and the honest consequence
+      is that the mention counts are noisier than they look. That is a reason to
+      treat the feature as unproven, which is what the disabled-by-default flag
+      says.
     * **Sentiment-negative attention.** "WIF is dead" counts as a mention. That
       is intentional — this module measures attention, not approval.
     * **Obfuscation.** ``W I F``, ``W1F`` and unicode homoglyphs are missed.
@@ -332,51 +483,16 @@ def alias_pattern(aliases: Iterable[str]) -> re.Pattern[str]:
 
 
 def matching_posts(posts: Iterable[Post], aliases: Iterable[str]) -> list[Post]:
-    """Items whose title or body mentions any alias as a whole word.
+    """Items whose text mentions any alias as a whole word.
 
-    Submissions and comments go through the same call and the same pattern: a
-    comment is a ``Post`` with an empty title, so ``text`` is its body and the
-    word-boundary rule applies identically. Nothing here branches on ``kind``,
-    which is the point — the matching semantics stay in exactly one place.
+    This is the **only** function in the codebase that reads untrusted post
+    text, and all it returns is a subset of the input — no derived string, no
+    excerpt, nothing that could be rendered. Submissions and comments go through
+    the same call and the same pattern; nothing here branches on ``kind``, which
+    is the point: the matching semantics stay in exactly one place.
     """
     pattern = alias_pattern(aliases)
     return [p for p in posts if pattern.search(p.text)]
-
-
-# ---------------------------------------------------------------------------
-# Polarity — deliberately trivial, deliberately low-trust
-# ---------------------------------------------------------------------------
-
-_BULLISH = frozenset(
-    """moon mooning pump pumping bullish bull long send sending ath breakout gem
-    rocket green hodl accumulate undervalued bounce rally parabolic buying""".split()
-)
-_BEARISH = frozenset(
-    """dump dumping bearish bear short rug rugged rugpull scam dead crash red
-    exit rekt bleeding bagholder bagholding avoid dumped selling""".split()
-)
-_WORD = re.compile(r"[a-z]+")
-
-
-def keyword_polarity(posts: Sequence[Post]) -> float | None:
-    """-1..1 from a flat keyword count, or ``None`` when no keyword appears.
-
-    This is a stopgap, not an analysis: no negation handling, no sarcasm, no
-    weighting. It is here only because a coarse tilt is occasionally worth a
-    sentence in the prompt, where it is labelled explicitly as low-trust. If you
-    ever feel tempted to improve it, improve the *breadth* metrics instead —
-    they are the ones that cost a shill farm money to fake.
-    """
-    bull = bear = 0
-    for post in posts:
-        for word in _WORD.findall(post.text.lower()):
-            if word in _BULLISH:
-                bull += 1
-            elif word in _BEARISH:
-                bear += 1
-    if bull + bear == 0:
-        return None
-    return (bull - bear) / (bull + bear)
 
 
 # ---------------------------------------------------------------------------
@@ -384,38 +500,46 @@ def keyword_polarity(posts: Sequence[Post]) -> float | None:
 # ---------------------------------------------------------------------------
 
 
-def cache_path(cfg: Config):
-    return cfg.data_dir / CACHE_FILENAME
+def cache_path(settings: SentimentSettings) -> Path:
+    return settings.data_dir / CACHE_FILENAME
 
 
-def _author_hash(author: str) -> str:
-    """One-way, non-reversible handle for an author.
+def _author_hash(author: str, key: bytes) -> str:
+    """Keyed, one-way handle for an author. Audit §15 (``sentiment.py``, security).
 
-    We only ever need "is this the same person as that other post", never "who".
-    Hashing at the boundary means a plaintext username cannot reach disk even by
-    accident. The digest is short because collisions across ~600 posts are
-    irrelevant to a contributor *count*.
+    The old implementation was a bare ``blake2b`` digest, documented as "salted"
+    and salted with nothing. A bare hash of a short username is not
+    pseudonymization: the population of accounts posting about a given coin is
+    small and public, so anyone holding the digests can enumerate candidate
+    handles and match them in seconds. Keying it removes that attack entirely —
+    without the key the digest is not reproducible, and with a per-process key
+    (the default) it is not even reproducible by us across runs.
+
+    We only ever need "is this the same person as that other post", never "who",
+    so 8 bytes is plenty: collisions across ~1000 items are irrelevant to a
+    contributor *count*, and a shorter digest is less to leak.
     """
-    return hashlib.blake2b(author.strip().lower().encode("utf-8"), digest_size=8).hexdigest()
+    return hashlib.blake2b(
+        author.strip().lower().encode("utf-8"), key=key, digest_size=8
+    ).hexdigest()
 
 
-def _baseline_unit(cfg: Config) -> str:
+def _baseline_unit(settings: SentimentSettings) -> str:
     """What one hourly bucket counts, recorded per symbol in the cache.
 
     ``CACHE_VERSION`` handles the one-time upgrade; this handles the toggle.
-    ``include_comments`` can be flipped in config at any time, and a bucket
-    counted over submissions+comments is not comparable to one counted over
-    submissions alone — a z-score computed across the boundary would read the
-    denominator change as a burst of attention. Storing the unit on the entry
-    means flipping it invalidates the affected symbols' history and nothing
-    else, instead of forcing a global version bump that discards every coin's
-    baseline to fix one.
+    ``include_comments`` can be flipped at any time, and a bucket counted over
+    submissions+comments is not comparable to one counted over submissions alone
+    — a z-score computed across the boundary would read the denominator change
+    as a burst of attention. Storing the unit on the entry means flipping it
+    invalidates the affected symbols' history and nothing else, instead of
+    forcing a global version bump that discards every coin's baseline to fix one.
     """
-    return "submissions+comments" if cfg.sentiment.include_comments else "submissions"
+    return "submissions+comments" if settings.include_comments else "submissions"
 
 
-def load_cache(cfg: Config) -> dict[str, Any]:
-    path = cache_path(cfg)
+def load_cache(settings: SentimentSettings) -> dict[str, Any]:
+    path = cache_path(settings)
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -429,8 +553,8 @@ def load_cache(cfg: Config) -> dict[str, Any]:
     return raw
 
 
-def save_cache(cfg: Config, cache: dict[str, Any]) -> None:
-    path = cache_path(cfg)
+def save_cache(settings: SentimentSettings, cache: dict[str, Any]) -> None:
+    path = cache_path(settings)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".json.tmp")
@@ -440,57 +564,38 @@ def save_cache(cfg: Config, cache: dict[str, Any]) -> None:
         log.warning("could not write sentiment cache to %s: %s", path, exc)
 
 
-def _brief_to_cache(brief: SentimentBrief) -> dict[str, Any]:
-    """Serialize a brief for disk, dropping ``top_posts`` entirely.
+def _brief_to_cache(brief_: SentimentBrief) -> dict[str, Any]:
+    """Serialize a brief for disk: counts, timestamps and one reason string.
 
-    See the module docstring: titles are user content and stay in memory. The
-    cached brief is counts and timestamps, which is what the TTL is protecting.
+    Built from the ``_CACHE_FIELDS`` allowlist rather than from the type's own
+    fields, so a future field added to ``SentimentBrief`` does not silently
+    become a thing we persist. That is the generalization of audit C7: the bug
+    was not that text was written to disk, it was that a serializer copied
+    whatever the type carried.
     """
-    return {
-        "symbol": brief.symbol,
-        "ts": brief.ts,
-        "source": brief.source,
-        "mention_velocity_1h": brief.mention_velocity_1h,
-        "mention_velocity_24h": brief.mention_velocity_24h,
-        "mention_zscore_7d": brief.mention_zscore_7d,
-        "unique_contributors_24h": brief.unique_contributors_24h,
-        "contributor_to_post_ratio": brief.contributor_to_post_ratio,
-        "polarity": brief.polarity,
-        "degraded_reason": brief.degraded_reason,
-    }
+    return {name: getattr(brief_, name) for name in _CACHE_FIELDS}
 
 
-def _brief_from_cache(entry: dict[str, Any]) -> SentimentBrief:
-    reasons = [r for r in (entry.get("degraded_reason"), "served from cache; top posts are not persisted") if r]
+def _brief_from_cache(entry: Mapping[str, Any]) -> SentimentBrief:
+    def num(name: str) -> float | None:
+        value = entry.get(name)
+        return None if value is None else float(value)
+
+    reasons = [r for r in (entry.get("degraded_reason"), "served from cache") if r]
+    contributors = entry.get("unique_contributors_24h")
     return SentimentBrief(
         symbol=str(entry["symbol"]),
         ts=float(entry["ts"]),
         source=entry["source"],
         # ``None`` survives the round trip: a cached "hour not indexed" must not
         # rehydrate as a confident zero.
-        mention_velocity_1h=(
-            None if entry.get("mention_velocity_1h") is None else float(entry["mention_velocity_1h"])
-        ),
-        mention_velocity_24h=(
-            None
-            if entry.get("mention_velocity_24h") is None
-            else float(entry["mention_velocity_24h"])
-        ),
-        mention_zscore_7d=(
-            None if entry.get("mention_zscore_7d") is None else float(entry["mention_zscore_7d"])
-        ),
-        unique_contributors_24h=(
-            None
-            if entry.get("unique_contributors_24h") is None
-            else int(entry["unique_contributors_24h"])
-        ),
-        contributor_to_post_ratio=(
-            None
-            if entry.get("contributor_to_post_ratio") is None
-            else float(entry["contributor_to_post_ratio"])
-        ),
-        top_posts=(),
-        polarity=None if entry.get("polarity") is None else float(entry["polarity"]),
+        mention_velocity_1h=num("mention_velocity_1h"),
+        mention_velocity_24h=num("mention_velocity_24h"),
+        mention_zscore_7d=num("mention_zscore_7d"),
+        unique_contributors_24h=(None if contributors is None else int(contributors)),
+        contributor_to_post_ratio=num("contributor_to_post_ratio"),
+        observed_through=num("observed_through"),
+        baseline_hours=int(entry.get("baseline_hours") or 0),
         degraded_reason="; ".join(reasons),
     )
 
@@ -505,21 +610,21 @@ def _hour_bucket(ts: float) -> str:
 
 
 def _update_history(
-    history: dict[str, int],
+    history: Mapping[str, int],
     posts: Sequence[Post],
-    cfg: SentimentConfig,
+    settings: SentimentSettings,
     now: float,
-    observed_end: float | None = None,
+    indexed_through: float | None = None,
 ) -> dict[str, int]:
     """Fold this tick's observation into the rolling hourly history.
 
     Each fetch sees the whole ``lookback_hours`` window, so we *overwrite* every
-    bucket inside it rather than adding. That makes the history self-healing:
-    a tick that was skipped, rate-limited or run on a laptop that was asleep
-    gets backfilled by the next successful fetch, and running twice in one
-    minute cannot double-count.
+    bucket inside it rather than adding. That makes the history self-healing: a
+    tick that was skipped, rate-limited or run on a laptop that was asleep gets
+    backfilled by the next successful fetch, and running twice in one minute
+    cannot double-count.
 
-    ``observed_end`` bounds how far the zero-seeding may reach. Seeding up to
+    ``indexed_through`` bounds how far the zero-seeding may reach. Seeding up to
     ``now`` when the source's index stops 10 hours short writes ten fabricated
     "zero mentions this hour" buckets into a 7-day baseline, which drags the
     mean down and inflates every later z-score. The self-healing overwrite does
@@ -528,48 +633,62 @@ def _update_history(
 
     Only integers land here. No ids, no authors, no text.
     """
-    window_start = now - cfg.lookback_hours * _SECONDS_PER_HOUR
-    end = now if observed_end is None else min(observed_end, now)
+    window_start = now - settings.lookback_hours * _SECONDS_PER_HOUR
+    end = now if indexed_through is None else min(indexed_through, now)
     observed: dict[str, int] = {}
     # Seed every *observed* hour in the window at zero — an hour with no
     # mentions is an observation, and dropping it would bias the baseline
     # upward. An hour the source has not reached is not an observation.
-    start_bucket = int(window_start // 3600)
-    end_bucket = int(end // 3600)
-    for bucket in range(start_bucket, end_bucket + 1):
+    for bucket in range(int(window_start // 3600), int(end // 3600) + 1):
         observed[str(bucket)] = 0
     for post in posts:
         if post.created_utc < window_start:
             continue
-        observed[_hour_bucket(post.created_utc)] = observed.get(_hour_bucket(post.created_utc), 0) + 1
+        key = _hour_bucket(post.created_utc)
+        observed[key] = observed.get(key, 0) + 1
 
     merged = dict(history)
     merged.update(observed)
 
-    cutoff = int((now - cfg.baseline_days * 24 * _SECONDS_PER_HOUR) // 3600)
+    cutoff = int((now - settings.baseline_days * 24 * _SECONDS_PER_HOUR) // 3600)
     return {k: int(v) for k, v in merged.items() if k.isdigit() and int(k) >= cutoff}
 
 
-def _zscore(history: dict[str, int], current_rate: float, now: float) -> tuple[float | None, str | None]:
-    """Z-score of the current hourly rate against completed historical hours.
+def baseline_buckets(history: Mapping[str, int], now: float) -> list[int]:
+    """Completed hourly buckets that do **not** overlap the current window.
 
-    The current hour is excluded from the baseline: it is partial, so including
-    it would drag the mean toward the very value we are testing.
+    Audit §7 (``sentiment.py::_zscore``): the old baseline excluded only the
+    *current* bucket, while ``current_rate`` is a rolling hour spanning
+    ``now-3600`` to ``now``. That rolling hour lies across two wall-clock
+    buckets, so the previous bucket contained part of the very observation being
+    scored — the baseline included the anomaly and therefore shrank it, which is
+    exactly backwards for a statistic whose only job is to detect one.
 
-    ``current_rate`` is a *rolling* hour (``now-3600`` to ``now``) while the
-    baseline buckets are wall-clock hours. Both are in mentions-per-hour so the
-    comparison is sound, but the rolling window is why the current bucket and
-    ``mention_velocity_1h`` will usually differ: a post 12 minutes before a
-    clock-aligned ``now`` is inside the rolling hour and inside the *previous*
-    bucket. That is the correct behaviour — a rolling window is what makes a
-    burst visible at 12:05 instead of at 13:00.
+    Strictly non-overlapping means: keep buckets whose index is below the bucket
+    containing ``now - 3600``. Everything at or above that index shares at least
+    one second with the window under test.
     """
-    current_bucket = _hour_bucket(now)
-    baseline = [v for k, v in history.items() if k != current_bucket]
+    cutoff = int((now - _SECONDS_PER_HOUR) // 3600)
+    return [int(v) for k, v in history.items() if str(k).isdigit() and int(k) < cutoff]
+
+
+def _zscore(
+    history: Mapping[str, int], current_rate: float, now: float
+) -> tuple[float | None, str | None]:
+    """Z-score of the current hourly rate against non-overlapping past hours.
+
+    Gaussian standardization of sparse, zero-inflated counts is the wrong
+    distribution and the audit says so; it is retained, labelled, as a crude
+    novelty descriptor rather than a probability, and it is one of the things
+    the required ablation has to justify before this stream may influence
+    anything. What *was* fixed is the leakage, which is a correctness bug rather
+    than a modelling choice: see :func:`baseline_buckets`.
+    """
+    baseline = baseline_buckets(history, now)
     if len(baseline) < MIN_BASELINE_HOURS:
         return None, (
-            f"no 7d baseline yet ({len(baseline)}/{MIN_BASELINE_HOURS} hourly "
-            "buckets accumulated); z-score will appear once history builds"
+            f"no baseline yet ({len(baseline)}/{MIN_BASELINE_HOURS} non-overlapping "
+            "hourly buckets accumulated); z-score will appear once history builds"
         )
     mean = sum(baseline) / len(baseline)
     variance = sum((v - mean) ** 2 for v in baseline) / len(baseline)
@@ -582,99 +701,101 @@ def _zscore(history: dict[str, int], current_rate: float, now: float) -> tuple[f
 
 
 def build_brief(
-    coin: CoinConfig,
-    cfg: Config,
+    coin: CoinLike,
+    settings: SentimentSettings,
     posts: Sequence[Post],
     source: str,
     now: float,
     *,
     history: dict[str, int] | None = None,
     extra_reasons: Sequence[str] = (),
-    observed_through: float | None = None,
+    indexed_through: float | None = None,
     sweep_size: int | None = None,
     sweep_unit: str = "posts",
 ) -> SentimentBrief:
-    """Turn a window of already-matched posts into a ``SentimentBrief``.
+    """Turn a window of already-matched posts into counts. No text survives here.
 
-    Every provider funnels through here so the arithmetic exists once. ``posts``
-    must already be filtered to ``coin``'s aliases; this function does not match.
+    Every provider funnels through this function so the arithmetic exists once.
+    ``posts`` must already be filtered to ``coin``'s aliases; this function does
+    not match. It reads only ``created_utc`` and ``author`` off them — never
+    ``text`` — which is what makes "no post body can reach a brief" a property
+    of the code rather than a convention.
 
     ``history`` is the rolling hourly-count dict for this symbol and is
     **mutated in place** (the caller owns persisting it). Pass ``None`` to skip
     baseline accumulation entirely, in which case ``mention_zscore_7d`` is
     ``None`` with a reason.
 
-    ``observed_through`` is the timestamp the source's index actually reaches —
+    ``indexed_through`` is the timestamp the source's index actually reaches —
     not the timestamp we asked for. These differ, and the gap is not small:
-    Arctic Shift was running ~10 hours behind live Reddit when this was
-    written. Everything after it is *unobserved*, and unobserved is not zero.
-    Passing ``None`` asserts the source is live through ``now``.
+    Arctic Shift was running ~10 hours behind live Reddit when this was written.
+    Everything after it is *unobserved*, and unobserved is not zero. Passing
+    ``None`` asserts the source is live through ``now``.
+
+    Note the distinction from ``SentimentBrief.observed_through``, which this
+    sets to ``now``: that field records when the counts became **available to
+    us**, which is necessarily later than when the posts were made. Using post
+    time as availability time is look-ahead — it credits a strategy with knowing
+    something at the moment it was written rather than at the moment it could
+    have been read, and at a 15-minute cadence with a 10-hour index lag that is
+    the difference between a backtest and a fantasy. The index coverage is a
+    separate fact and travels in ``degraded_reason``.
 
     ``sweep_size`` is how many items the provider's **whole sweep** returned —
     submissions plus comments, when comments are enabled — counted before the
-    per-coin alias filter. It is the denominator this coin's count sits over,
-    and the second half of the same distinction ``observed_through`` draws,
-    along the other axis:
+    per-coin alias filter. It is the denominator this coin's count sits over:
 
-    * ``0`` means nothing at all was read, so there is no window to speak
-      about. Every rate comes back ``None``, because a sweep that saw no posts
-      cannot tell "nobody mentioned this coin" apart from "we did not look".
+    * ``0`` means nothing at all was read, so there is no window to speak about.
+      Every rate comes back ``None``, because a sweep that saw no posts cannot
+      tell "nobody mentioned this coin" apart from "we did not look".
     * ``> 0`` means the window *was* read, so a zero for this coin is a real
-      measurement and stays zero — and the size travels into
-      ``degraded_reason`` so the model can see how thin the denominator is.
+      measurement and stays zero — and the size travels into ``degraded_reason``
+      so a consumer can see how thin the denominator is.
     * ``None`` means the caller is not reporting one and the window is assumed
       observed, which is what a hand-built ``posts`` list wants.
 
-    ``sweep_unit`` names what ``sweep_size`` counted, for the text handed to the
-    model. It is not cosmetic: "the sweep observed 1008 posts" would be a false
-    claim about the composition of the evidence when 872 of them are comments.
-
-    Zero posts inside the observed window is a perfectly good answer and
-    produces a valid brief with zero velocity — "nobody is talking about this"
-    is information. Zero posts because the hour has not been indexed yet, or
-    because the sweep came back empty, is not information, and comes back as
-    ``None``.
+    ``sweep_unit`` names what ``sweep_size`` counted. It is not cosmetic: "the
+    sweep observed 1008 posts" would be a false claim about the composition of
+    the evidence when 872 of them are comments.
     """
-    scfg = cfg.sentiment
-    window_hours = float(scfg.lookback_hours)
+    window_hours = float(settings.lookback_hours)
     window_start = now - window_hours * _SECONDS_PER_HOUR
 
     # Never trust a source to be ahead of the clock; ``min`` also absorbs the
     # vendor-bug case of a future timestamp.
-    observed_end = now if observed_through is None else min(observed_through, now)
-    lag_seconds = max(now - observed_end, 0.0)
+    index_end = now if indexed_through is None else min(indexed_through, now)
+    lag_seconds = max(now - index_end, 0.0)
 
-    # An empty sweep is a read that returned nothing, not a quiet Reddit, and
-    # it reaches here *without any subreddit having errored*: arctic-shift
-    # answers a subreddit with no posts in the window with HTTP 200 and
-    # ``{"data": []}``, which never lands in ``failures``. That is not a rare
-    # shape — r/SatoshiStreetBets came back that way for two entire days
-    # (2026-09-15 and -16) and for 24 of 28 consecutive hours scanned on
-    # 2026-09-19. Before this flag existed the all-empty case produced
-    # ``0.0 mentions/hour``, ``0`` contributors and ``degraded_reason = None``:
-    # a maximally confident "attention is flat" — the bearish read — with no
-    # marker on it at all, which is strictly worse than the unindexed-hour case
-    # below because that one at least says why.
+    # An empty sweep is a read that returned nothing, not a quiet Reddit, and it
+    # reaches here *without any subreddit having errored*: arctic-shift answers a
+    # subreddit with no posts in the window with HTTP 200 and ``{"data": []}``,
+    # which never lands in ``failures``. That is not a rare shape —
+    # r/SatoshiStreetBets came back that way for two entire days (2026-09-15 and
+    # -16) and for 24 of 28 consecutive hours scanned on 2026-09-19. Before this
+    # flag existed the all-empty case produced ``0.0 mentions/hour``, ``0``
+    # contributors and ``degraded_reason = None``: a maximally confident
+    # "attention is flat" — the bearish read — with no marker on it at all.
     observed = sweep_size is None or sweep_size > 0
 
     reasons: list[str] = list(extra_reasons)
     if not observed:
         reasons.append(
             "sweep returned no posts at all from any of the "
-            f"{len(scfg.subreddits)} configured subreddits; that is a failed "
+            f"{len(settings.subreddits)} configured subreddits; that is a failed "
             "read, not silence — every count here is unmeasured, not zero"
         )
     if lag_seconds > _MAX_INDEX_LAG_SECONDS:
         reasons.append(
             f"source index is {lag_seconds / _SECONDS_PER_HOUR:.1f}h behind live; "
-            f"counts cover only through {time.strftime('%H:%M UTC', time.gmtime(observed_end))}"
+            "counts cover only through "
+            f"{time.strftime('%H:%M UTC', time.gmtime(index_end))}"
         )
 
-    # The window is closed at both ends. The upper bound matters: a clock skew
-    # or a vendor bug that hands back a future timestamp would otherwise create
-    # an hourly bucket beyond ``now`` which the retention trim (a lower bound)
-    # can never remove, quietly poisoning the baseline for every later run.
-    in_window = [p for p in posts if window_start <= p.created_utc <= observed_end]
+    # The window is closed at both ends. The upper bound matters: a clock skew or
+    # a vendor bug that hands back a future timestamp would otherwise create an
+    # hourly bucket beyond ``now`` which the retention trim (a lower bound) can
+    # never remove, quietly poisoning the baseline for every later run.
+    in_window = [p for p in posts if window_start <= p.created_utc <= index_end]
 
     # The rolling hour only means something if the source has indexed it. With a
     # 10h lag it never has, and every tick would otherwise report a confident
@@ -691,14 +812,14 @@ def build_brief(
     # grows with the lag. With nothing observed there is no denominator at all,
     # and "0 posts / 24h = 0.0 mentions/hour" is the same manufactured bearish
     # claim one field over from the one guarded above.
-    observed_hours = max(observed_end - window_start, 0.0) / _SECONDS_PER_HOUR
-    if not observed or observed_hours <= 0:
-        velocity_24h = None
-    else:
-        velocity_24h = len(in_window) / observed_hours
+    observed_hours = max(index_end - window_start, 0.0) / _SECONDS_PER_HOUR
+    velocity_24h = (
+        None if (not observed or observed_hours <= 0) else len(in_window) / observed_hours
+    )
 
+    key = settings.author_key
     contributors = {
-        _author_hash(p.author)
+        _author_hash(p.author, key)
         for p in in_window
         if p.author.strip().lower() not in _NON_CONTRIBUTORS
     }
@@ -709,30 +830,32 @@ def build_brief(
     # Denominator is *all* matched items, including bot/deleted ones and
     # including comments: a wall of deleted posts is exactly the pattern this
     # ratio is meant to expose, and so is one account replying to itself forty
-    # times. Counting comments in the numerator but not the denominator — or
-    # splitting this into two ratios — would both blur what the number means,
-    # which is "how many distinct humans produced the attention we matched".
-    # One person writing one submission and nineteen comments about it should
-    # score 0.05, and does.
+    # times. One person writing one submission and nineteen comments about it
+    # should score 0.05, and does.
     ratio = (len(contributors) / len(in_window)) if in_window else None
 
+    baseline_hours = 0
     if history is None:
         zscore = None
         reasons.append("no cross-run baseline available (called without a cache)")
     elif not observed:
         # Seeding "0 mentions this hour" for hours nothing was read from writes
-        # fabrications straight into the 7-day baseline, and unlike the
-        # index-lag case the self-healing overwrite can never repair them: no
-        # later sweep re-observes an hour, it only re-reads whatever the index
-        # holds now. The recorded 2026-09-18 run persisted 15 such buckets per
-        # coin, and a baseline of manufactured zeros drags the mean down and
-        # inflates every z-score computed against it afterwards.
+        # fabrications straight into the baseline, and unlike the index-lag case
+        # the self-healing overwrite can never repair them: no later sweep
+        # re-observes an hour, it only re-reads whatever the index holds now.
+        # The recorded 2026-09-18 run persisted 15 such buckets per coin, and a
+        # baseline of manufactured zeros drags the mean down and inflates every
+        # z-score computed against it afterwards.
         zscore = None
-        reasons.append("no z-score: nothing was observed this tick, so the baseline is untouched")
+        baseline_hours = len(baseline_buckets(history, now))
+        reasons.append(
+            "no z-score: nothing was observed this tick, so the baseline is untouched"
+        )
     else:
-        merged = _update_history(history, in_window, scfg, now, observed_end)
+        merged = _update_history(history, in_window, settings, now, index_end)
         history.clear()  # mutate in place; the caller holds the reference
         history.update(merged)
+        baseline_hours = len(baseline_buckets(history, now))
         if velocity_1h is None:
             # Nothing to score. The baseline is still updated above, so the
             # history keeps building for whenever the index does catch up.
@@ -745,34 +868,15 @@ def build_brief(
 
     # A zero is only as strong as its denominator, and here the denominator is
     # small. Measured 2026-09-19, these five subreddits produced 23 BONK
-    # submissions, 3 popcat and 1 dogwifhat across the whole preceding 90 days
-    # — roughly 0.26 BONK posts/day, and the newest BONK submission in the
-    # index was 14.7 days old. A 24h window with no mentions is therefore the
+    # submissions, 3 popcat and 1 dogwifhat across the whole preceding 90 days —
+    # roughly 0.26 BONK posts/day, and the newest BONK submission in the index
+    # was 14.7 days old. A 24h window with no mentions is therefore the
     # *expected* outcome and is nowhere near evidence that attention fell off.
-    # Stating the sweep size lets the model weigh the zero instead of trading
-    # on it; without it, "0.0 mentions/hour" looks like a reading of the same
-    # quality as "12.0 mentions/hour".
     if observed and sweep_size and not in_window:
         reasons.append(
             f"0 mentions of {coin.symbol}; the sweep observed {sweep_size} "
             f"{sweep_unit} over {observed_hours:.1f}h"
         )
-
-    # A comment has no title, so its excerpt comes from the body — same cap,
-    # same "handed to the model raw" contract. ``kind`` travels with it so the
-    # prompt and the terminal report can label what they are showing instead of
-    # rendering a comment as an empty-titled post, which is what happened
-    # before: ``report.py`` printed ``r/solana [12]`` and no text at all.
-    top = tuple(
-        TopPost(
-            title=(p.title or p.body)[:_TITLE_MAX_CHARS],
-            score=p.score,
-            age_hours=round(p.age_hours(now), 2),
-            subreddit=p.subreddit,
-            kind=p.kind,
-        )
-        for p in sorted(in_window, key=lambda p: p.score, reverse=True)[:_TOP_POSTS]
-    )
 
     return SentimentBrief(
         symbol=coin.symbol,
@@ -783,8 +887,8 @@ def build_brief(
         mention_zscore_7d=zscore,
         unique_contributors_24h=unique_contributors,
         contributor_to_post_ratio=ratio,
-        top_posts=top,
-        polarity=keyword_polarity(in_window),
+        observed_through=now if observed else None,
+        baseline_hours=baseline_hours,
         degraded_reason="; ".join(reasons) or None,
     )
 
@@ -797,10 +901,14 @@ def build_brief(
 class SentimentProvider(Protocol):
     """The seam. Anything with this shape can feed ``brief()``."""
 
-    def fetch(self, coin: CoinConfig, cfg: Config) -> SentimentBrief | None: ...
+    def fetch(
+        self, coin: CoinLike, settings: SentimentSettings
+    ) -> SentimentBrief | None: ...
 
 
-def sweep_observed_through(provider: object, sweep: Sequence[Post], now: float) -> float | None:
+def sweep_index_through(
+    provider: object, sweep: Sequence[Post], now: float
+) -> float | None:
     """How far this provider's index actually reaches.
 
     ``None`` means "live through ``now``". For a lagging source it is the newest
@@ -808,16 +916,14 @@ def sweep_observed_through(provider: object, sweep: Sequence[Post], now: float) 
     alias filter, because a coin nobody mentioned would otherwise look like a
     stale index and have its (genuine) zero suppressed.
 
-    An empty sweep stays ``None`` because there is no newest post to measure
-    and a fabricated lag would be a second, wrong explanation. It emphatically
-    does **not** mean the sweep was fine: an earlier version of this docstring
-    claimed an empty sweep "is already reported through ``failures``", and that
-    was false. ``failures`` only records subreddits whose request *raised*;
-    arctic-shift answers a subreddit with nothing in the window with HTTP 200
-    and ``{"data": []}``, so an all-empty sweep leaves ``failures`` empty and
-    this function returning ``None``, which together read as a healthy, live,
-    silent Reddit. The "we saw nothing" signal therefore travels separately, as
-    ``build_brief``'s ``sweep_size``.
+    An empty sweep stays ``None`` because there is no newest post to measure and
+    a fabricated lag would be a second, wrong explanation. It emphatically does
+    **not** mean the sweep was fine: ``failures`` only records subreddits whose
+    request *raised*, and arctic-shift answers a subreddit with nothing in the
+    window with HTTP 200 and ``{"data": []}``. An all-empty sweep therefore
+    leaves ``failures`` empty and this function returning ``None``, which
+    together read as a healthy, live, silent Reddit. The "we saw nothing" signal
+    travels separately, as ``build_brief``'s ``sweep_size``.
     """
     if not getattr(provider, "index_lags", False):
         return None
@@ -835,35 +941,29 @@ class PostSource(Protocol):
     a distribution from two aggregate velocities — which would mean inventing
     numbers, the one thing this module refuses to do.
 
-    ``fetch()`` remains the contract; this is an optional upgrade. A provider
-    implementing only ``fetch()`` works fine and simply reports no baseline.
-
-    Deliberately method-only: ``runtime_checkable`` protocols raise ``TypeError``
-    on ``isinstance`` if they declare data members, and ``brief()`` needs the
-    ``isinstance`` check. Implementations also carry a ``source`` string and an
-    ``index_lags`` flag, both read via ``getattr``.
+    Deliberately method-only: ``runtime_checkable`` protocols raise
+    ``TypeError`` on ``isinstance`` if they declare data members, and ``brief()``
+    needs the ``isinstance`` check. Implementations also carry a ``source``
+    string and an ``index_lags`` flag, both read via ``getattr``.
 
     ``index_lags`` says whether this source's index can trail live. It must be
     declared rather than inferred, because the only thing measurable from the
-    outside — the newest post in the sweep — means "how fresh the index is"
-    only for a source that sweeps whole subreddits (Arctic Shift). For a source
-    that runs a per-coin query (PRAW), an empty or old result set means the coin
-    is quiet, and treating that as index lag would suppress the true reading.
+    outside — the newest post in the sweep — means "how fresh the index is" only
+    for a source that sweeps whole subreddits (Arctic Shift). For a source that
+    runs a per-coin query, an empty or old result set means the coin is quiet,
+    and treating that as index lag would suppress the true reading.
 
-    Implementations may also expose ``sweep_notes``: a list of plain-English
-    caveats about the sweep that *just* returned, read via ``getattr`` and
-    folded into ``degraded_reason``. It exists because ``failures`` can only say
-    "this subreddit raised", and partial coverage is neither a failure nor a
-    success — a comment walk that reached 21.8h of a 24h window returned real
-    data for a window narrower than the one requested, and the difference
-    between "few comments mention BONK" and "we could only read 90% of the
-    window" has to reach the model. Kept off the ``posts()`` return tuple
-    deliberately: widening that to three elements would break every fake
-    provider in the test suite to carry something optional.
+    Implementations may also expose ``sweep_notes``: plain-English caveats about
+    the sweep that *just* returned, read via ``getattr`` and folded into
+    ``degraded_reason``. ``failures`` can only say "this subreddit raised", and
+    partial coverage is neither a failure nor a success — a comment walk that
+    reached 21.8h of a 24h window returned real data for a narrower window than
+    the one requested, and the difference between "few comments mention BONK"
+    and "we could only read 90% of the window" has to reach the consumer.
     """
 
     def posts(
-        self, coin: CoinConfig, cfg: Config, now: float
+        self, coin: CoinLike, settings: SentimentSettings, now: float
     ) -> tuple[list[Post], list[str]]:
         """Return ``(unfiltered posts in window, names of failed sources)``."""
         ...
@@ -874,33 +974,27 @@ class ArcticShiftProvider:
 
     Verified live 2026-09-18 against ``GET /api/posts/search``:
 
-    * envelope is ``{"data": [...]}``  on success and
+    * envelope is ``{"data": [...]}`` on success and
       ``{"data": null, "error": "..."}`` on failure, always HTTP-coded too;
     * ``data`` items are raw Reddit submission objects (``created_utc`` in
-      seconds, ``author`` as a plain username string, ``selftext``, ``score``);
+      seconds, ``author`` as a plain username string, ``selftext``);
     * ``limit`` is capped at 100;
     * ``fields`` accepts a comma-separated whitelist and 400s on unknown names;
     * ``after``/``before`` are epoch seconds and ``sort`` takes ``desc``/``asc``.
 
     Note what this class does **not** do: it never sends the ``query``
     parameter. Server-side full-text search on this host is both fragile
-    (repeated 422 ``"Timeout. Maybe slow down a bit"`` on
-    ``subreddit``+``query``) and lossy (it returned zero rows for terms that are
-    demonstrably present in the same window). Pulling the subreddit window and
-    matching locally is one extra page of JSON and gives us control of the
-    word-boundary rule, which is the part that actually determines signal
-    quality. (The host also refuses ``query`` on its own: 400 ``"'query' query
-    parameter requires one of: author, subreddit"``.)
+    (repeated 422 ``"Timeout. Maybe slow down a bit"`` on ``subreddit``+
+    ``query``) and lossy (it returned zero rows for terms demonstrably present
+    in the same window). Pulling the subreddit window and matching locally is
+    one extra page of JSON and gives us control of the word-boundary rule, which
+    is the part that actually determines signal quality.
 
     **The window sweep was audited on 2026-09-19 and returns everything the
     index holds**, which is what makes a zero from it trustworthy enough to
     report. Re-running r/solana's 24h window as 24 separate one-hour queries
     surfaced no post the single 24h query had missed (33 from the hourly walk,
-    34 from the one-shot, the extra one posted during the run). ``sort=desc``
-    orders newest-first as documented and ``limit`` truncates from the new end
-    — ``limit=10`` returned the 10 most recent. So when this sweep reports no
-    mentions, the posts genuinely do not contain them; the place to look next
-    is the base rate, not the fetch.
+    34 from the one-shot, the extra one posted during the run).
     """
 
     source = "arctic_shift"
@@ -909,7 +1003,9 @@ class ArcticShiftProvider:
     #: sweep is a true measure of that lag.
     index_lags = True
 
-    def __init__(self, client: httpx.Client | None = None, base: str = ARCTIC_SHIFT_BASE) -> None:
+    def __init__(
+        self, client: httpx.Client | None = None, base: str = ARCTIC_SHIFT_BASE
+    ) -> None:
         self._client = client
         self._owns_client = client is None
         self._base = base.rstrip("/")
@@ -917,20 +1013,25 @@ class ArcticShiftProvider:
         #: Caveats about the sweep that just ran. See ``PostSource``.
         self.sweep_notes: list[str] = []
 
-    def _http(self, cfg: Config) -> httpx.Client:
+    def _http(self, settings: SentimentSettings) -> httpx.Client:
         if self._client is None:
             # http.make_client verifies against the OS trust store rather than
             # certifi; arctic-shift fails CERTIFICATE_VERIFY_FAILED otherwise on
             # any TLS-inspecting corporate network. Reddit asks for a descriptive
             # UA, which overrides the browser default make_client sends.
             self._client = make_client(
-                max(cfg.data.http_timeout_seconds, 30.0),
-                {"User-Agent": cfg.sentiment.reddit_user_agent},
+                settings.http_timeout_seconds, {"User-Agent": settings.reddit_user_agent}
             )
         return self._client
 
     def _page(
-        self, cfg: Config, endpoint: str, fields: str, subreddit: str, after: int, before: int
+        self,
+        settings: SentimentSettings,
+        endpoint: str,
+        fields: str,
+        subreddit: str,
+        after: int,
+        before: int,
     ) -> list[dict[str, Any]]:
         """One page from ``/{endpoint}/search``. Raises on any non-200.
 
@@ -939,7 +1040,7 @@ class ArcticShiftProvider:
         whitelist, so ``_ARCTIC_COMMENT_FIELDS`` against ``posts`` or
         ``_ARCTIC_FIELDS`` against ``comments`` is a 400 on every request.
         """
-        resp = self._http(cfg).get(
+        resp = self._http(settings).get(
             f"{self._base}/{endpoint}/search",
             params={
                 "subreddit": subreddit,
@@ -951,7 +1052,6 @@ class ArcticShiftProvider:
             },
         )
         if resp.status_code != 200:
-            detail = ""
             try:
                 detail = str(resp.json().get("error"))
             except Exception:
@@ -962,7 +1062,7 @@ class ArcticShiftProvider:
 
     def _walk(
         self,
-        cfg: Config,
+        settings: SentimentSettings,
         endpoint: str,
         fields: str,
         normalize: Callable[[dict[str, Any]], Post | None],
@@ -973,24 +1073,23 @@ class ArcticShiftProvider:
     ) -> float:
         """Page backwards through one subreddit's window. Returns coverage.
 
-        The return value is the oldest epoch second this walk actually reached
-        — ``after`` when the window was covered end to end, something larger
-        when it stopped short. Stopping short is normal on the comments
-        endpoint and unreachable-by-design (see ``_ARCTIC_SPACING_S``), so a
-        partial walk keeps everything it did read and reports the shortfall
-        rather than discarding the page or retrying into the same timeout.
+        The return value is the oldest epoch second this walk actually reached —
+        ``after`` when the window was covered end to end, something larger when
+        it stopped short. Stopping short is normal on the comments endpoint and
+        unreachable-by-design (see ``_ARCTIC_SPACING_S``), so a partial walk
+        keeps everything it did read and reports the shortfall rather than
+        discarding the page or retrying into the same timeout.
 
         A raise on the *first* page means we got nothing and the caller should
         treat the subreddit as failed; a raise on a later page means we got
         something, and throwing it away would be strictly worse than reporting
-        it with a caveat. That asymmetry is why this catches per page instead
-        of letting the exception reach the caller.
+        it with a caveat.
         """
         cursor = int(now) + 1
         covered = float(cursor)
         for page in range(_ARCTIC_MAX_PAGES):
             try:
-                raw = self._page(cfg, endpoint, fields, subreddit, after, cursor)
+                raw = self._page(settings, endpoint, fields, subreddit, after, cursor)
             except Exception as exc:
                 if page == 0:
                     raise
@@ -1021,19 +1120,13 @@ class ArcticShiftProvider:
         return covered
 
     def posts(
-        self, coin: CoinConfig, cfg: Config, now: float
+        self, coin: CoinLike, settings: SentimentSettings, now: float
     ) -> tuple[list[Post], list[str]]:
         """All submissions and comments in the lookback window, every subreddit.
 
-        ``coin`` is unused: this source pulls the whole subreddit window once
-        and lets ``matching_posts`` do the per-coin filtering, so three coins
-        cost one sweep rather than three.
-
-        Comments are swept unless ``cfg.sentiment.include_comments`` is off, in
-        which case this behaves exactly as it did before comments existed here.
-        They roughly double the request count (measured 2026-09-19: ~10 comment
-        pages against 5 submission pages for the five configured subreddits) and
-        multiply the rows read by 7.4.
+        ``coin`` is unused: this source pulls the whole subreddit window once and
+        lets ``matching_posts`` do the per-coin filtering, so three coins cost
+        one sweep rather than three.
 
         Returns ``(posts, failures)``. A subreddit that errors is skipped and
         named in ``failures`` so the brief can be marked degraded rather than
@@ -1041,25 +1134,28 @@ class ArcticShiftProvider:
         merely *stopped short* is not a failure and is reported through
         ``sweep_notes`` instead.
         """
-        # One sweep serves every coin: the window is identical for all of them
-        # and this host rate-limits hard, so re-pulling it per coin would triple
-        # the request count for identical bytes.
         if self._memo is not None and abs(now - self._memo[0]) < _MEMO_SECONDS:
             self.sweep_notes = list(self._memo[3])
             return list(self._memo[1]), list(self._memo[2])
 
-        scfg = cfg.sentiment
-        window_hours = float(scfg.lookback_hours)
+        window_hours = float(settings.lookback_hours)
         after = int(now - window_hours * _SECONDS_PER_HOUR)
         out: dict[tuple[str, str], Post] = {}
         failures: list[str] = []
         # subreddit -> hours of the window its comment walk actually covered.
         short: dict[str, float] = {}
 
-        for subreddit in scfg.subreddits:
+        for subreddit in settings.subreddits:
             try:
                 self._walk(
-                    cfg, "posts", _ARCTIC_FIELDS, _post_from_arctic, subreddit, after, now, out
+                    settings,
+                    "posts",
+                    _ARCTIC_FIELDS,
+                    _post_from_arctic,
+                    subreddit,
+                    after,
+                    now,
+                    out,
                 )
             except Exception as exc:
                 log.warning("arctic-shift: r/%s failed: %s", subreddit, exc)
@@ -1070,11 +1166,11 @@ class ArcticShiftProvider:
                 continue
             time.sleep(_ARCTIC_SPACING_S)
 
-            if not scfg.include_comments:
+            if not settings.include_comments:
                 continue
             try:
                 covered = self._walk(
-                    cfg,
+                    settings,
                     "comments",
                     _ARCTIC_COMMENT_FIELDS,
                     _comment_from_arctic,
@@ -1087,8 +1183,7 @@ class ArcticShiftProvider:
                 # Submissions for this subreddit are already in ``out``, so this
                 # is a gap in the evidence rather than a dead subreddit. Naming
                 # it in ``failures`` would claim we read nothing from it, which
-                # is false and would understate the brief's quality in the
-                # opposite direction.
+                # is false.
                 log.warning("arctic-shift: r/%s comments failed: %s", subreddit, exc)
                 short[subreddit] = 0.0
             else:
@@ -1102,11 +1197,10 @@ class ArcticShiftProvider:
                 f"r/{name} {hours:.1f}h" for name, hours in sorted(short.items())
             )
             # Two causes, one consequence, so one message: the walk either
-            # exhausted its page budget or hit the per-range 422, and either
-            # way the older end of the window was never read. Measured live
-            # 2026-09-19: r/CryptoCurrency reached 17.4h of 24h at 600
-            # comments, r/solana 20.7h. Naming only the timeout would be wrong
-            # about which one fired on any given tick.
+            # exhausted its page budget or hit the per-range 422, and either way
+            # the older end of the window was never read. Measured live
+            # 2026-09-19: r/CryptoCurrency reached 17.4h of 24h at 600 comments,
+            # r/solana 20.7h.
             notes.append(
                 f"comment sweep covered less than the requested {window_hours:.0f}h "
                 f"window ({detail}); a busy subreddit outruns the "
@@ -1114,7 +1208,7 @@ class ArcticShiftProvider:
                 "older pages, so comment-derived counts there are a floor"
             )
 
-        if failures and len(failures) == len(scfg.subreddits):
+        if failures and len(failures) == len(settings.subreddits):
             raise SourceUnavailable(
                 f"arctic-shift returned nothing for any of {len(failures)} subreddits"
             )
@@ -1122,7 +1216,7 @@ class ArcticShiftProvider:
         self._memo = (now, list(out.values()), list(failures), list(notes))
         return list(out.values()), failures
 
-    def fetch(self, coin: CoinConfig, cfg: Config) -> SentimentBrief | None:
+    def fetch(self, coin: CoinLike, settings: SentimentSettings) -> SentimentBrief | None:
         """Standalone brief, with no cross-run baseline.
 
         ``brief()`` normally goes through ``posts()`` instead so it can maintain
@@ -1130,18 +1224,18 @@ class ArcticShiftProvider:
         ``SentimentProvider`` on its own.
         """
         now = time.time()
-        raw_posts, failures = self.posts(coin, cfg, now)
+        raw_posts, failures = self.posts(coin, settings, now)
         return build_brief(
             coin,
-            cfg,
+            settings,
             matching_posts(raw_posts, coin.aliases),
             self.source,
             now,
             history=None,
             extra_reasons=[*_failure_reasons(failures), *self.sweep_notes],
-            observed_through=sweep_observed_through(self, raw_posts, now),
+            indexed_through=sweep_index_through(self, raw_posts, now),
             sweep_size=len(raw_posts),
-            sweep_unit=_sweep_unit(cfg),
+            sweep_unit=_sweep_unit(settings),
         )
 
     def close(self) -> None:
@@ -1151,42 +1245,43 @@ class ArcticShiftProvider:
 
 
 def _post_from_arctic(item: dict[str, Any]) -> Post | None:
-    """Normalize one Arctic Shift row. Returns ``None`` for unusable rows."""
+    """Normalize one Arctic Shift submission row. ``None`` for unusable rows.
+
+    Title and body are concatenated immediately. After audit C7 nothing
+    downstream may distinguish them — both are public text and neither may be
+    rendered — so keeping two fields would only preserve the shape that made the
+    injection possible.
+    """
     try:
+        title = str(item.get("title") or "")
+        body = str(item.get("selftext") or "")
         return Post(
             id=str(item.get("id") or ""),
             created_utc=float(item["created_utc"]),
             author=str(item.get("author") or "[deleted]"),
-            title=str(item.get("title") or ""),
-            body=str(item.get("selftext") or ""),
-            score=int(item.get("score") or 0),
+            text=f"{title}\n{body}",
             subreddit=str(item.get("subreddit") or ""),
         )
-    except (KeyError, TypeError, ValueError):
+    except KeyError, TypeError, ValueError:
         return None
 
 
 def _comment_from_arctic(item: dict[str, Any]) -> Post | None:
     """Normalize one Arctic Shift comment row. ``None`` for unusable rows.
 
-    Two shape differences from ``_post_from_arctic``, both forced by the
-    endpoint rather than chosen: the text arrives in ``body`` (there is no
-    ``selftext`` on a comment and asking for one 400s), and there is no title to
-    read, so ``title`` stays empty and the ``text`` property falls back to the
-    body alone.
+    The text arrives in ``body`` — there is no ``selftext`` on a comment and
+    asking for one 400s (see ``_ARCTIC_COMMENT_FIELDS``).
     """
     try:
         return Post(
             id=str(item.get("id") or ""),
             created_utc=float(item["created_utc"]),
             author=str(item.get("author") or "[deleted]"),
-            title="",
-            body=str(item.get("body") or ""),
-            score=int(item.get("score") or 0),
+            text=str(item.get("body") or ""),
             subreddit=str(item.get("subreddit") or ""),
             kind="comment",
         )
-    except (KeyError, TypeError, ValueError):
+    except KeyError, TypeError, ValueError:
         return None
 
 
@@ -1196,38 +1291,22 @@ class PrawProvider:
     PRAW 8.0.3 notes (checked against the installed package, not 7.x memory):
 
     * ``Subreddit.new(**Unpack[ListingGeneratorKwargs])`` — ``limit=`` still
-      works and still means "stop after N", with ``None`` for "as many as
-      Reddit will paginate" (1000).
+      works and still means "stop after N", with ``None`` for "as many as Reddit
+      will paginate" (1000).
     * ``Reddit.__init__(site_name=None, *, config_interpolation=None,
       requestor_class=None, requestor_kwargs=None, **config_settings)`` —
-      ``site_name`` is the only positional parameter; credentials still arrive
-      as keywords, so the 7.x construction call is unchanged.
+      ``site_name`` is the only positional parameter.
     * ``reddit.subreddit`` is an *instance* attribute in 8.x, not a class
-      method, so ``hasattr(praw.Reddit, "subreddit")`` is now ``False``. Only
-      matters if you were duck-typing against the class.
-    * Listing generators are typed ``**Unpack[ListingGeneratorKwargs]``;
-      ``limit=`` still works.
+      method, so ``hasattr(praw.Reddit, "subreddit")`` is now ``False``.
     * Riding on prawcore 4.0.0.
 
-    **Sweeps ``/new`` rather than running a search.** This is the difference
-    between current data and nearly-current data, and it is the whole reason to
-    prefer PRAW over the archive mirror. Reddit's search index is populated
-    asynchronously, so a post is live on ``/new`` before it is findable by
-    ``search()`` — the same class of staleness this module already refuses to
-    paper over in ``ArcticShiftProvider``, merely smaller. ``/new`` is a
-    listing, not a query, so there is nothing to wait for.
-
-    Three things fall out of the switch, all good:
-
-    * Reddit's tokenizer leaves the picture entirely. It was only ever a
-      prefilter — every hit is re-checked locally by ``matching_posts``,
-      because Reddit stems and will happily return "wife" for a "wif" query —
-      and a prefilter that can silently drop a real mention is worse than none.
-    * One sweep serves every coin, so three coins cost one pass over each
-      subreddit instead of three searches.
-    * It is the same shape as the Arctic Shift sweep, so both providers now
-      hand ``matching_posts`` the same unfiltered window and the matching
-      semantics live in exactly one place.
+    **Sweeps ``/new`` rather than running a search.** Reddit's search index is
+    populated asynchronously, so a post is live on ``/new`` before it is
+    findable by ``search()`` — the same class of staleness this module refuses
+    to paper over in ``ArcticShiftProvider``, merely smaller. ``/new`` is a
+    listing, not a query, so there is nothing to wait for. It also means
+    Reddit's tokenizer leaves the picture entirely (it stems, and will happily
+    return "wife" for a "wif" query), and one sweep serves every coin.
     """
 
     source = "praw"
@@ -1241,14 +1320,14 @@ class PrawProvider:
         #: Caveats about the sweep that just ran. See ``PostSource``.
         self.sweep_notes: list[str] = []
 
-    def _client(self, cfg: Config) -> Any:
+    def _client(self, settings: SentimentSettings) -> Any:
         if self._reddit is None:
             import praw  # imported lazily: the keyless path must not need it
 
             self._reddit = praw.Reddit(
-                client_id=cfg.sentiment.reddit_client_id,
-                client_secret=cfg.sentiment.reddit_client_secret,
-                user_agent=cfg.sentiment.reddit_user_agent,
+                client_id=settings.reddit_client_id,
+                client_secret=settings.reddit_client_secret,
+                user_agent=settings.reddit_user_agent,
                 check_for_updates=False,
             )
             # Read-only is the default for an app-only script grant, but say it
@@ -1257,49 +1336,39 @@ class PrawProvider:
         return self._reddit
 
     def posts(
-        self, coin: CoinConfig, cfg: Config, now: float
+        self, coin: CoinLike, settings: SentimentSettings, now: float
     ) -> tuple[list[Post], list[str]]:
         """Every submission and comment in the window, across the subreddits.
 
         ``coin`` is unused, exactly as in ``ArcticShiftProvider.posts``: one
-        ``/new`` sweep covers all three coins and ``matching_posts`` does the
-        per-coin filtering afterwards.
+        ``/new`` sweep covers every coin and ``matching_posts`` does the per-coin
+        filtering afterwards.
 
-        ``/r/<sub>/comments/`` is swept the same way unless
-        ``cfg.sentiment.include_comments`` is off. It is a listing rather than a
-        search, so the argument for preferring ``/new`` over ``search()``
-        applies unchanged: nothing sits between a comment being written and us
-        reading it.
-
-        Returns ``(posts, failures)``. A subreddit that errors is skipped and
-        named in ``failures``, so a dead sub shows up as a degraded brief rather
-        than a quietly lower mention count. All of them failing is a dead
-        source, not a quiet day, and raises ``SourceUnavailable``.
+        Returns ``(posts, failures)``. All of them failing is a dead source, not
+        a quiet day, and raises ``SourceUnavailable``.
         """
-        scfg = cfg.sentiment
-        if not scfg.subreddits:
+        if not settings.subreddits:
             raise SourceUnavailable("no subreddits configured")
 
-        # One sweep serves every coin — the window does not depend on which coin
-        # is asking, and Reddit's 100 queries/min is worth not spending three
-        # times over on identical bytes.
         if self._memo is not None and abs(now - self._memo[0]) < _MEMO_SECONDS:
             self.sweep_notes = list(self._memo[3])
             return list(self._memo[1]), list(self._memo[2])
 
-        after = now - scfg.lookback_hours * _SECONDS_PER_HOUR
-        reddit = self._client(cfg)
+        after = now - settings.lookback_hours * _SECONDS_PER_HOUR
+        reddit = self._client(settings)
         out: dict[tuple[str, str], Post] = {}
         failures: list[str] = []
         # Subreddits whose comment listing ran out of pagination before it
         # reached the window edge. Not a failure — real data, narrower window.
         truncated: list[str] = []
 
-        for name in scfg.subreddits:
+        for name in settings.subreddits:
             try:
                 subreddit = reddit.subreddit(name)
-                self._drain(subreddit.new(limit=_PRAW_NEW_LIMIT), _post_from_praw, after, out)
-                if scfg.include_comments:
+                self._drain(
+                    subreddit.new(limit=_PRAW_NEW_LIMIT), _post_from_praw, after, out
+                )
+                if settings.include_comments:
                     # ``comments`` is a cachedproperty returning a callable
                     # CommentHelper; ``subreddit.comments(limit=N)`` is the
                     # supported call in praw 8.0.3.
@@ -1322,11 +1391,12 @@ class PrawProvider:
         if truncated:
             notes.append(
                 f"comment listing hit Reddit's {_PRAW_COMMENT_LIMIT}-item pagination "
-                f"limit before the window edge for {', '.join(f'r/{n}' for n in truncated)}; "
-                "comment-derived counts there are a floor"
+                f"limit before the window edge for "
+                f"{', '.join(f'r/{n}' for n in truncated)}; comment-derived counts "
+                "there are a floor"
             )
 
-        if failures and len(failures) == len(scfg.subreddits):
+        if failures and len(failures) == len(settings.subreddits):
             raise SourceUnavailable(
                 f"praw returned nothing for any of {len(failures)} subreddits"
             )
@@ -1360,34 +1430,31 @@ class PrawProvider:
                 # normally the end of the window — but a pinned or
                 # recently-approved submission can surface out of order, and
                 # stopping on one of those would silently truncate an entire
-                # subreddit to nothing. Require a short run before believing we
-                # are past the edge.
+                # subreddit to nothing.
                 stale_run += 1
                 if stale_run >= _PRAW_STALE_RUN:
                     break
                 continue
             stale_run = 0
-            # Keyed by (kind, id): a comment id and a submission id come from
-            # different Reddit namespaces and can collide as bare strings.
             out[(post.kind, post.id)] = post
         return seen
 
-    def fetch(self, coin: CoinConfig, cfg: Config) -> SentimentBrief | None:
+    def fetch(self, coin: CoinLike, settings: SentimentSettings) -> SentimentBrief | None:
         """Standalone brief, with no cross-run baseline. See the note on
         ``ArcticShiftProvider.fetch``."""
         now = time.time()
-        found, failures = self.posts(coin, cfg, now)
+        found, failures = self.posts(coin, settings, now)
         return build_brief(
             coin,
-            cfg,
+            settings,
             matching_posts(found, coin.aliases),
             self.source,
             now,
             history=None,
             extra_reasons=[*_failure_reasons(failures), *self.sweep_notes],
-            observed_through=sweep_observed_through(self, found, now),
+            indexed_through=sweep_index_through(self, found, now),
             sweep_size=len(found),
-            sweep_unit=_sweep_unit(cfg),
+            sweep_unit=_sweep_unit(settings),
         )
 
 
@@ -1402,13 +1469,13 @@ def _post_from_praw(submission: Any) -> Post | None:
         author = getattr(submission, "author", None)
         name = getattr(author, "name", None) or (str(author) if author else "[deleted]")
         subreddit = getattr(submission, "subreddit", "")
+        title = str(getattr(submission, "title", "") or "")
+        body = str(getattr(submission, "selftext", "") or "")
         return Post(
             id=str(getattr(submission, "id", "") or ""),
             created_utc=float(getattr(submission, "created_utc", 0.0)),
             author=str(name),
-            title=str(getattr(submission, "title", "") or ""),
-            body=str(getattr(submission, "selftext", "") or ""),
-            score=int(getattr(submission, "score", 0) or 0),
+            text=f"{title}\n{body}",
             subreddit=str(getattr(subreddit, "display_name", None) or subreddit or ""),
         )
     except Exception:
@@ -1416,12 +1483,7 @@ def _post_from_praw(submission: Any) -> Post | None:
 
 
 def _comment_from_praw(comment: Any) -> Post | None:
-    """Normalize one PRAW ``Comment``. Same ``getattr`` discipline as above.
-
-    A ``Comment`` has ``body`` and no ``title``, and its ``score`` can be hidden
-    for the first hour — PRAW reports that as ``0`` rather than ``None``, which
-    only affects the ordering of ``top_posts`` and never a count.
-    """
+    """Normalize one PRAW ``Comment``. Same ``getattr`` discipline as above."""
     try:
         author = getattr(comment, "author", None)
         name = getattr(author, "name", None) or (str(author) if author else "[deleted]")
@@ -1430,9 +1492,7 @@ def _comment_from_praw(comment: Any) -> Post | None:
             id=str(getattr(comment, "id", "") or ""),
             created_utc=float(getattr(comment, "created_utc", 0.0)),
             author=str(name),
-            title="",
-            body=str(getattr(comment, "body", "") or ""),
-            score=int(getattr(comment, "score", 0) or 0),
+            text=str(getattr(comment, "body", "") or ""),
             subreddit=str(getattr(subreddit, "display_name", None) or subreddit or ""),
             kind="comment",
         )
@@ -1440,14 +1500,14 @@ def _comment_from_praw(comment: Any) -> Post | None:
         return None
 
 
-def _sweep_unit(cfg: Config) -> str:
-    """What ``sweep_size`` counted, for the sentence handed to the model."""
-    return "posts and comments" if cfg.sentiment.include_comments else "posts"
+def _sweep_unit(settings: SentimentSettings) -> str:
+    """What ``sweep_size`` counted, for the sentence handed to the consumer."""
+    return "posts and comments" if settings.include_comments else "posts"
 
 
-def default_provider(cfg: Config) -> SentimentProvider:
+def default_provider(settings: SentimentSettings) -> SentimentProvider:
     """PRAW when credentials exist, Arctic Shift otherwise."""
-    if cfg.sentiment.has_reddit_credentials:
+    if settings.has_reddit_credentials:
         return PrawProvider()
     return ArcticShiftProvider()
 
@@ -1458,8 +1518,8 @@ def default_provider(cfg: Config) -> SentimentProvider:
 
 
 def brief(
-    coin: CoinConfig,
-    cfg: Config,
+    coin: CoinLike,
+    settings: SentimentSettings,
     *,
     provider: SentimentProvider | None = None,
     now: float | None = None,
@@ -1469,30 +1529,34 @@ def brief(
 
     Checks the on-disk TTL cache first, then the provider. **Never raises.**
 
+    Returns ``None`` immediately when ``settings.enabled`` is false, which is
+    the default (audit §7: the social pipeline leaves the production path until
+    a locked ablation justifies it). ``prompts.py`` renders that absence as
+    explicitly unavailable rather than as a neutral value.
+
     ``cache`` lets a caller (``briefs()``) load and save the cache file once for
     a whole sweep instead of once per coin; pass ``None`` for standalone use.
     """
-    scfg = cfg.sentiment
-    if not scfg.enabled:
-        log.info("sentiment disabled in config; %s brief is unavailable", coin.symbol)
+    if not settings.enabled:
+        log.info(
+            "sentiment disabled (pending the audit's ablation); %s brief is unavailable",
+            coin.symbol,
+        )
         return None
 
     now = time.time() if now is None else now
     owns_cache = cache is None
-    cache = load_cache(cfg) if cache is None else cache
+    cache = load_cache(settings) if cache is None else cache
     entry = cache.setdefault("symbols", {}).setdefault(coin.symbol, {})
 
     # What this entry's hourly buckets count, versus what we are about to count.
     # ``include_comments`` can be flipped between runs and the two units are not
     # comparable — a 7.4x larger denominator would read as a burst of attention
     # on every coin at once, which is the most expensive possible false signal.
-    # Scoped to the symbol on purpose (the user's call): flipping the toggle
-    # should cost the affected symbols' baselines, not every coin's.
-    unit = _baseline_unit(cfg)
+    unit = _baseline_unit(settings)
     cached_unit = entry.get("unit")
-    unit_changed = cached_unit is not None and cached_unit != unit
     unit_reasons: list[str] = []
-    if unit_changed:
+    if cached_unit is not None and cached_unit != unit:
         log.info(
             "%s: sentiment baseline unit changed (%s -> %s); discarding this "
             "symbol's history",
@@ -1510,23 +1574,26 @@ def brief(
 
     cached = entry.get("brief")
     fetched_at = entry.get("fetched_at")
-    if cached and isinstance(fetched_at, (int, float)):
-        if now - float(fetched_at) < scfg.cache_ttl_seconds:
-            log.debug(
-                "%s: sentiment cache hit (%.0fs old, ttl %ss)",
-                coin.symbol,
-                now - float(fetched_at),
-                scfg.cache_ttl_seconds,
-            )
-            try:
-                return _brief_from_cache(cached)
-            except Exception as exc:
-                log.warning("%s: unusable cached brief (%s); refetching", coin.symbol, exc)
+    if (
+        cached
+        and isinstance(fetched_at, (int, float))
+        and now - float(fetched_at) < settings.cache_ttl_seconds
+    ):
+        log.debug(
+            "%s: sentiment cache hit (%.0fs old, ttl %ss)",
+            coin.symbol,
+            now - float(fetched_at),
+            settings.cache_ttl_seconds,
+        )
+        try:
+            return _brief_from_cache(cached)
+        except Exception as exc:
+            log.warning("%s: unusable cached brief (%s); refetching", coin.symbol, exc)
 
-    provider = provider or default_provider(cfg)
+    provider = provider or default_provider(settings)
 
-    # The persisted hourly history for this symbol. ``build_brief`` mutates it
-    # in place with this tick's exact per-hour counts; we write it straight back
+    # The persisted hourly history for this symbol. ``build_brief`` mutates it in
+    # place with this tick's exact per-hour counts; we write it straight back
     # into the cache entry afterwards.
     history = {
         k: int(v)
@@ -1538,14 +1605,14 @@ def brief(
     # httpx, praw, prawcore, JSON decoding, DNS and a TLS-inspecting corporate
     # proxy can each raise something different, and *none* of them justify
     # failing a trading tick. Sentiment is one evidence stream out of several;
-    # losing it must degrade the prompt, not stop it. Anything unexpected is
-    # logged with a traceback (at DEBUG) so it stays debuggable.
+    # losing it must degrade the prompt, not stop it.
+    result: SentimentBrief | None
     try:
         if isinstance(provider, PostSource):
-            found, failures = provider.posts(coin, cfg, now)
+            found, failures = provider.posts(coin, settings, now)
             result = build_brief(
                 coin,
-                cfg,
+                settings,
                 matching_posts(found, coin.aliases),
                 getattr(provider, "source", "arctic_shift"),
                 now,
@@ -1557,15 +1624,15 @@ def brief(
                     # optional part of the seam; a provider without it is fine.
                     *getattr(provider, "sweep_notes", ()),
                 ],
-                observed_through=sweep_observed_through(provider, found, now),
+                indexed_through=sweep_index_through(provider, found, now),
                 sweep_size=len(found),
-                sweep_unit=_sweep_unit(cfg),
+                sweep_unit=_sweep_unit(settings),
             )
         else:
             # A provider that only speaks ``fetch()`` owns its own arithmetic,
             # including whatever it decided about the baseline. We do not
             # second-guess it and we do not fabricate history for it.
-            result = provider.fetch(coin, cfg)
+            result = provider.fetch(coin, settings)
     except Exception as exc:
         log.warning(
             "%s: sentiment provider %s failed: %s",
@@ -1586,7 +1653,7 @@ def brief(
     entry["unit"] = unit
 
     if owns_cache:
-        save_cache(cfg, cache)
+        save_cache(settings, cache)
     return result
 
 
@@ -1594,49 +1661,60 @@ def _failure_reasons(failures: Sequence[str]) -> list[str]:
     return [f"sources unreachable: {', '.join(failures)}"] if failures else []
 
 
-def briefs(cfg: Config, **kw: Any) -> dict[str, SentimentBrief | None]:
+def briefs(
+    coins: Sequence[CoinLike], settings: SentimentSettings, **kw: Any
+) -> dict[str, SentimentBrief | None]:
     """Every configured coin's brief, keyed by symbol.
 
     One cache read and one cache write for the whole sweep, and one provider
     instance shared across coins so the HTTP connection (and the Arctic Shift
     rate-limit spacing) is reused. Coins are independent: one failing produces a
     ``None`` for that symbol only.
+
+    With the stream disabled — the default — no provider is constructed, no
+    cache file is touched and every value is ``None``. A disabled experiment
+    should cost nothing, including on disk.
     """
-    cache = load_cache(cfg)
-    provider = kw.pop("provider", None) or (default_provider(cfg) if cfg.sentiment.enabled else None)
+    if not settings.enabled:
+        return {coin.symbol: None for coin in coins}
+
+    cache = load_cache(settings)
+    provider = kw.pop("provider", None) or default_provider(settings)
     out: dict[str, SentimentBrief | None] = {}
     try:
-        for coin in cfg.coins:
-            out[coin.symbol] = brief(coin, cfg, provider=provider, cache=cache, **kw)
+        for coin in coins:
+            out[coin.symbol] = brief(coin, settings, provider=provider, cache=cache, **kw)
     finally:
-        save_cache(cfg, cache)
+        save_cache(settings, cache)
         close = getattr(provider, "close", None)
         if callable(close):
             try:
                 close()
             except Exception:
-                pass
+                log.debug("provider close failed", exc_info=True)
     return out
 
 
 __all__ = [
     "ARCTIC_SHIFT_BASE",
-    "ArcticShiftProvider",
     "MIN_BASELINE_HOURS",
+    "ArcticShiftProvider",
+    "CoinLike",
     "Post",
     "PostSource",
     "PrawProvider",
     "SentimentProvider",
-    "default_provider",
+    "SentimentSettings",
     "SourceUnavailable",
     "alias_pattern",
+    "baseline_buckets",
     "brief",
     "briefs",
     "build_brief",
-    "sweep_observed_through",
     "cache_path",
-    "keyword_polarity",
+    "default_provider",
     "load_cache",
     "matching_posts",
     "save_cache",
+    "sweep_index_through",
 ]

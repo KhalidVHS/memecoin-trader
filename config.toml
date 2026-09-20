@@ -1,4 +1,27 @@
 # The only file you need to edit.
+#
+# Every key here populates a frozen parameter object defined next to the code
+# that enforces it — RiskParams in risk.py, MarkParams in portfolio.py,
+# StrategySettings in strategy.py, and so on. config.py does not restate their
+# defaults, so an absent key takes the enforcing module's own default rather
+# than a second copy that can drift from it. If you want to know what a limit
+# does, the docstring on that field is the authority.
+#
+# Units, which have bitten before: under [risk], max_position_pct and
+# stop_loss_pct are FRACTIONS (0.30 = 30%). Every other _pct in this file is a
+# WHOLE PERCENT (3.0 = 3%). config.py range-checks the two fractions so a 30
+# typed where 0.30 was meant fails at startup instead of authorising a 3,000%
+# position.
+
+# "read_only" | "paper" | "live".
+#   read_only — evidence, forecasts and proposed orders, nothing written, no
+#               position ever changes. This is what --dry-run now means; the
+#               audit's C12 was that the old --dry-run could still liquidate.
+#   paper     — the simulated book. The only mode that trades today.
+#   live      — refused at construction. There is no wallet, no signer and no
+#               settlement path, and pretending otherwise is how a paper book
+#               becomes a real loss.
+execution_mode = "paper"
 
 [portfolio]
 starting_cash_usd = 1000.0
@@ -22,16 +45,76 @@ symbol = "POPCAT"
 mint = "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr"
 aliases = ["POPCAT", "popcat"]
 
+# ---------------------------------------------------------------------------
+# Strategy — who decides what to hold
+# ---------------------------------------------------------------------------
+[strategy]
+# "cash" | "baseline" | "advisory".
+#   cash     — targets zero everywhere. The null hypothesis, and the control
+#              arm any claim of alpha has to beat.
+#   baseline — deterministic, shrunk momentum with an explicit cost hurdle and
+#              an uncertainty band. The default.
+#   advisory — the baseline plus a language model that may *modify* targets.
+#
+# The default is not the model. Audit C6's finding is that the LLM held order
+# authority with no measured predictive value, and a default *is* authority —
+# it is what runs when nobody chose. Turning it on is now one visible line in
+# this file, which is also what makes an honest A/B against "baseline" possible.
+kind = "baseline"
+
+horizon_seconds = 3600.0     # the window a forecast is a forecast *of*
+# A position is only opened when the LOWER quantile of the expected net return
+# clears this — not the mean. A wide, uncertain +5% is not a trade; a tight
+# +1.2% is. This is the single knob that decides how often anything happens.
+#
+# 2026-09-20: lowered from 1.0 alongside `shrinkage` and `interval_vol_multiple`
+# below, at the operator's explicit request for more trade frequency. None of
+# the three touch ROUND_TRIP_COST_PCT (0.8%, hardcoded in strategy.py) — that
+# is a measured cost estimate, not a conservatism knob, and a net return still
+# has to clear it before any of these three matter. What moved is how much
+# momentum is required, and how much of the uncertainty band eats into it,
+# before that net return counts as a view worth acting on. This has NOT been
+# validated against any held-out sample — it trades statistical caution for
+# frequency, on faith, exactly as asked.
+entry_hurdle_pct = 0.2
+# Fraction of the trailing h1 move carried into the forecast. Was 0.10 (a
+# fixed class constant, not configurable, until this change). Raising it means
+# the strategy takes the observed trend more at face value instead of mostly
+# discounting it as noise.
+shrinkage = 0.6
+# Half-width of the predictive interval, as a multiple of realised vol. Was
+# 1.5 (also a fixed constant). Lowering it narrows the interval the hurdle is
+# tested against, which is a claim about precision this system has not earned
+# — the tradeoff made explicitly here for trade frequency.
+interval_vol_multiple = 0.5
+# Retained as the sizing floor for callers with no cash figure to size
+# against (see risk.RiskParams.default_entry_usd); ordinary entries are sized
+# by cash_fraction_per_entry below instead.
+flat_size_usd = 25.0
+min_trade_usd = 10.0         # must be >= [risk] min_trade_usd
+rebalance_band_usd = 8.0     # don't churn for a drift smaller than the fees
+max_positions = 3            # matches the 3 configured coins: one position per coin, max
+# Sizing proportional to conviction requires a calibration that has never
+# been measured, and an uncalibrated conviction number scaling position size
+# is how a bad model loses money faster than a coin flip — so this is NOT
+# conviction-based sizing. It is bankroll sizing: a new entry may take up to
+# this fraction of currently uncommitted cash. Raised from a flat $25 entry
+# to 50% of remaining cash at the operator's explicit request (2026-09-20).
+# An existing position is not resized to this fraction on later ticks — see
+# strategy.BaselineStrategy.decide.
+cash_fraction_per_entry = 0.5
+
 [model]
 name = "claude-opus-5"
 # "low" | "medium" | "high" | "xhigh" | "max" — a knob, not a constant, and the
 # largest single lever on what this costs, because it is thinking tokens that
-# move. Set to xhigh deliberately: the evidence bundle rewards a model that
-# reasons across three disagreeing streams, which is exactly what effort buys.
-# The README's $180-250/month was measured at "high" — expect more here.
+# move. The README's $180-250/month was measured at "high".
+#
+# Only billed when [strategy] kind = "advisory". Under "baseline" or "cash"
+# nothing here is read except by `memetrader report`.
 effort = "xhigh"
 max_tokens = 8000
-# Per-million-token prices, used only to report spend in `memetrader report`.
+# Per-million-token prices, used only to report spend.
 price_input_per_mtok = 5.0
 price_output_per_mtok = 25.0
 price_cache_read_per_mtok = 0.5
@@ -43,24 +126,93 @@ price_cache_write_per_mtok = 6.25
 
 [cadence]
 fast_tick_seconds = 60       # mark the book, enforce stops — no model call
-slow_tick_seconds = 900     # full LLM decision cycle (15 min)
+slow_tick_seconds = 300      # full decision cycle (5 min) — was 900 (15 min)
 
+# ---------------------------------------------------------------------------
+# Risk — populates risk.RiskParams. See that class for what each field means.
+# ---------------------------------------------------------------------------
 [risk]
-max_position_pct = 0.30      # of total book value
-stop_loss_pct = 0.15         # forced exit at -15% from entry
-min_trade_usd = 10.0
-max_price_impact_pct = 3.0
+# Eligibility: what may be traded at all, and when it may not.
 max_snapshot_age_seconds = 90
 min_liquidity_usd = 50_000.0
-# No max-trades-per-day and no minimum hold time. Deliberate.
+min_pool_age_seconds = 86_400        # a pool younger than a day has no history
+require_known_pool_age = true        # unknown age is a veto, not a pass
+post_stop_quarantine_seconds = 3600  # no re-entry into what just stopped out
+min_seconds_between_entries = 300    # one entry per symbol per slow tick (matches the 5min cadence)
+
+# Position and book shape. max_position_pct, the exposure caps and the sleeve
+# cap below were raised from 30%/60%/60% to 50%/90%/90% (2026-09-20) so that up
+# to 3 positions each sized at up to 50% of remaining cash (see
+# [strategy] cash_fraction_per_entry) are not silently clipped by a tighter
+# ceiling set for the old flat $25 sizing.
+max_position_pct = 0.50              # FRACTION of book value, per symbol
+stop_loss_pct = 0.15                 # FRACTION; forced exit at -15% from entry
+max_gross_exposure_pct = 90.0
+max_net_exposure_pct = 90.0
+min_cash_floor_pct = 10.0            # always keep enough to pay gas and exit; pairs with the 90% caps above
+
+# Correlation. Audit C10: these are not three bets. BONK, WIF and POPCAT are
+# one factor with three tickers — they gap together, and a per-symbol cap
+# with no sleeve cap is how the book ends up entirely in the same trade. The
+# sleeve defaults to every configured coin if this list is omitted, which is
+# also every coin actually configured here, so this cap and the gross/net
+# caps above are the same ceiling in practice.
+correlated_sleeve = ["BONK", "WIF", "POPCAT"]
+max_sleeve_exposure_pct = 90.0
+
+# Volatility targeting. Only ever *reduces* size — a quiet tape does not earn a
+# bigger position, because on this asset class quiet is the prelude, not the
+# state. An unavailable volatility estimate blocks the entry rather than
+# defaulting to "normal".
+target_volatility_pct = 8.0
+require_volatility_estimate = true
+
+# Per-order bounds. The uncalibrated-forecast fallback (every forecast today)
+# is max(default_entry_usd, cash_usd * max_cash_fraction_pct / 100) — this
+# mirrors [strategy] cash_fraction_per_entry as the risk layer's own
+# independent ceiling, so a strategy bug asking for more than 50% of cash is
+# still capped here. max_entry_usd raised from 100.0 so it does not clip an
+# entry sized at up to 50% of a roughly $1,000 book.
+default_entry_usd = 25.0
+max_cash_fraction_pct = 50.0
+max_entry_usd = 600.0
+min_trade_usd = 10.0
+max_price_impact_pct = 3.0
+max_quote_age_seconds = 10.0         # a quote older than this is not a price
+max_depth_participation_pct = 1.0    # never take more than 1% of pool depth
+gas_usd_per_swap = 0.21
+# 0.0 on purpose: the router's outAmount is already net of the pool fee.
+# Charging it again was the 45x double-count C2 found. Non-zero only if you
+# start quoting from a source that reports gross.
+assumed_pool_fee_pct = 0.0
+
+# Loss budgets and the halt conditions. These are the audit's requirement, and
+# they are deliberately separate from anything about model spend.
+max_daily_loss_pct = 5.0
+max_window_loss_pct = 10.0
+loss_window_seconds = 604_800        # 7 days
+max_drawdown_pct = 20.0              # from peak book value; halts the run
+max_consecutive_failures = 3         # failed swaps in a row -> halt, not retry
+
+[risk.mark]
+# What an unrealised position is worth. C8: marking at cost is not a mark, and
+# a mid price is not something you can sell into.
+mid_haircut_pct = 2.0                # mid is a reference, so discount it
+estimate_min_haircut_pct = 5.0       # an estimate is worse than a mid
+max_mark_age_seconds = 120.0         # beyond this the position is unmarkable
+# A stop may fire against a haircut mid when no route quote is available.
+# Setting this false means an outage freezes stops, which is the more dangerous
+# failure of the two on an asset that gaps.
+allow_mid_stop_reference = true
 
 [execution]
-# Fill realism. Defaults are researched, not invented — see README.
 slippage_bps_fallback = 50.0      # used only when Jupiter is unreachable
 gas_usd_per_swap = 0.21           # ~0.002 SOL; rises hard during congestion
 failed_tx_rate = 0.06             # a failed swap still pays full gas
 default_pool_fee_pct = 0.25       # when routePlan label is unrecognised
 
+# Retained for cost *reporting* and for the strategy's round-trip hurdle. No
+# longer deducted from a fill — see ExecutionConfig.fee_pct_for.
 [execution.pool_fee_pct]
 Raydium = 0.25
 "Raydium CLMM" = 0.25
@@ -78,32 +230,81 @@ dexscreener_base = "https://api.dexscreener.com"
 geckoterminal_base = "https://api.geckoterminal.com/api/v2"
 jupiter_base = "https://lite-api.jup.ag"
 jupiter_base_keyed = "https://api.jup.ag"
-http_timeout_seconds = 15.0
-candles_5m = 100             # enough history for EMA21 / BB20 / ATR14
+http_timeout_seconds = 15.0       # now the READ timeout; see [http]
+candles_5m = 100                  # enough history for EMA21 / BB20 / ATR14
 candles_1h = 100
 
-[sentiment]
-enabled = true
-# Deliberately *below* [cadence] slow_tick_seconds, so a decision tick always
-# re-fetches and never reads this cache. That is not a dead setting: sentiment
-# is fetched only from loop.evidence(), which the 15-min tick calls once — but
-# which `status` and `once --dry-run` also call, and those get run
-# interactively many times a minute. The TTL is a debounce for those, not a
-# cost control for the loop.
+[market]
+max_mints_per_request = 30        # DexScreener's documented batch ceiling
+
+# Token safety. The screen fails CLOSED: a check that could not be evaluated is
+# an "unknown", and an unknown blocks the trade exactly like a veto does. The
+# two are reported separately so "too thin" and "we never found out how thin"
+# stay distinguishable.
 #
-# Raising it above the cadence would be the wrong trade, because a cache hit is
-# lossy in a way "staleness in seconds" does not capture: _brief_from_cache
-# returns top_posts=() — titles are never written to disk, see the Reddit API
-# terms note in sentiment.py's docstring — so every hit silently strips the
-# only qualitative evidence in this stream. And the headline number,
-# mention_velocity_1h, is an acceleration; it is the single figure where ten
-# minutes stale does the most damage. A miss is cheap by comparison: one sweep
-# of the 5 subreddits below at <=6 paginated requests each, against a 100
-# req/min budget. It also loses nothing durable — the hourly history behind the
-# 7d z-score is persisted separately and is written back on every fetch.
-cache_ttl_seconds = 600
+# What is NOT checked here, and must be before any of this touches real money:
+# mint and freeze authority, LP ownership and lock, holder and dev
+# concentration, Token-2022 transfer-fee/hook extensions, and a sellability
+# probe. All five need an on-chain RPC this system does not have. SafetyVerdict
+# names them in `deferred` on every single verdict so their absence is visible
+# in the record rather than assumed away.
+[safety_screen]
+min_liquidity_usd = 50_000.0
+min_pool_age_seconds = 604_800    # one week
+min_volume_24h_usd = 250_000.0
+min_liquidity_to_fdv = 0.005      # a $1bn FDV on a $200k pool is not a market
+max_snapshot_age_seconds = 900.0
+require_trusted_quote = true      # only price against SOL/USDC/USDT pairs
+
+[http]
+# One scalar timeout is how a single hung read eats a whole 60-second tick, so
+# the four phases are separate. Omit any of these to take the module default.
+connect_timeout_seconds = 5.0
+read_timeout_seconds = 12.0
+write_timeout_seconds = 10.0
+pool_timeout_seconds = 5.0
+
+max_attempts = 3
+# The retry budget must fit inside a fast tick. config.py rejects anything over
+# 45s: a retry that returns after the tick it belongs to has already been
+# missed is a stall, not resilience.
+retry_budget_seconds = 20.0
+backoff_base_seconds = 0.25
+backoff_multiplier = 3.0
+backoff_max_seconds = 4.0
+max_retry_after_seconds = 10.0    # cap on an honoured Retry-After header
+
+# After this many consecutive failures a host is cut off for the cooldown, and
+# `open_hosts` becomes a data-health signal risk can halt on. A vendor that is
+# down should stop being asked, not be asked harder.
+breaker_failure_threshold = 4
+breaker_cooldown_seconds = 60.0
+
+[sentiment]
+# OFF by default, changed from true by the audit.
+#
+# §7 found public Reddit text being interpolated into a prompt that held order
+# authority. The text path is gone entirely — no bodies, no titles, no
+# usernames, and SentimentBrief has no field capable of carrying a string an
+# outsider wrote. But removing the injection channel does not make the stream
+# *useful*, and the numbers that remain are still cheap for an outsider to move:
+# mention velocity is exactly what a flood of accounts manipulates.
+#
+# So it stays off until the ablation the audit specifies has actually been run
+# and the stream has demonstrated it contributes something a price series does
+# not already contain. An input with no measured contribution should not be on
+# by default merely because it was on yesterday. Set true to collect for that
+# measurement; it will be read only under [strategy] kind = "advisory".
+enabled = false
+
+# Deliberately below [cadence] slow_tick_seconds, so a decision tick always
+# re-fetches and never reads this cache. The TTL is a debounce for interactive
+# `status` / `once` runs, not a cost control for the loop. (Lowered from 600 to
+# stay below slow_tick_seconds after that was cut from 900 to 300.)
+cache_ttl_seconds = 240
 lookback_hours = 24
 baseline_days = 7            # window for the mention z-score
+
 # Sweep comments as well as submissions. Submissions alone are too sparse to
 # carry signal here — 23 BONK submissions across all five subreddits in the 90
 # days to 2026-09-19, newest 14.7 days old, so a 24h window is almost always
@@ -115,9 +316,9 @@ baseline_days = 7            # window for the mention z-score
 # denominator, not 7.4x more signal. What it buys is a zero that means
 # something: 1008 items read with no mention is a measurement, 136 is a sample.
 #
-# Costs roughly 2x the requests per sweep; set false to halve it back. Flipping
-# this discards the affected symbols' hourly baselines, because a bucket
-# counting submissions+comments is not comparable to one counting submissions.
+# Costs roughly 2x the requests per sweep. Flipping this discards the affected
+# symbols' hourly baselines, because a bucket counting submissions+comments is
+# not comparable to one counting submissions.
 include_comments = true
 subreddits = [
     "CryptoCurrency",
@@ -126,7 +327,14 @@ subreddits = [
     "solana",
     "pumpfun",
 ]
+# Contributor hashes are keyed blake2b. The key is NOT set here — it comes from
+# MEMETRADER_AUTHOR_HASH_KEY in .env, because a salt committed next to the
+# hashes it salts is not a salt, and a bare digest of a short Reddit username
+# is reversible by enumeration in seconds. Unset means a fresh random key per
+# process: hashes stay unlinkable across runs, which is the safe default and
+# costs only cross-run contributor-overlap counts.
 
 [prompt]
 # How many past decisions the model sees, one compressed line each.
+# Only read under [strategy] kind = "advisory".
 decision_history = 10

@@ -1,5 +1,10 @@
 # Runtime state — never commit a trading ledger
 data/
+# Books left behind by a schema change. The post-audit state format is not
+# readable by the old loader and vice versa, so an incompatible book is moved
+# aside rather than deleted; it is still runtime state and still must not be
+# committed.
+data-v*/
 .env
 
 # Documented run output: the book, the decisions and the verbatim prompts of a

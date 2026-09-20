@@ -33,6 +33,12 @@ build-backend = "uv_build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    # Tests that spend real money on a live API. Skipped unless
+    # MEMETRADER_LIVE_TESTS=1, because a suite that silently bills ~$0.10 per
+    # run is a suite people stop running.
+    "live: billed live API calls; opt in with MEMETRADER_LIVE_TESTS=1",
+]
 
 [tool.ruff]
 # Measured rather than guessed. Across src/ the hand-wrapped lines pile up at 90

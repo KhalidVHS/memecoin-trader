@@ -1,573 +1,1021 @@
-"""The wiring, not the arithmetic.
+"""Integration tests for the scheduler — the seam where the audit's findings lived.
 
-Every module below ``loop.py`` is tested on its own terms elsewhere. What is
-only testable here is what happens when they are connected: who writes to the
-ledger, who is allowed to fail, and whether a tick that could not reach the
-model is distinguishable from a tick that decided to do nothing.
+These are not unit tests of the modules the loop calls; those live next door and
+number in the hundreds. What is tested here is the *order of operations*, which
+is where C3, C4, C11 and C12 each came from. Every one of them was a case where
+two individually-correct components were wired together wrongly, so every one of
+them is invisible to a test that exercises either component alone.
 
-The first test in this file exists because of a real bug. ``_apply`` and
-``_force_exit`` both called ``journal.append(trades_path, fill)`` on a fill that
-``LocalPaperBroker.place_order`` had *already* logged, so every single trade
-landed in ``trades.jsonl`` twice while ``state.json`` moved once. Nothing caught
-it — the book was correct, the reconciliation identity held, and only counting
-the rows revealed it. So the rows get counted.
-
-No network: ``market.snapshot`` and ``quotes.fill_quote`` are monkeypatched, and
-every test gets its own ``tmp_path`` data dir.
+The fakes are deliberately dumb: a broker that records what it was asked to do,
+a strategy that returns fixed targets, a quoter that counts calls. A fake that
+reimplements the real component's logic cannot catch a wiring bug, because it
+will happily agree with whatever wiring it is given.
 """
 
 from __future__ import annotations
 
-import json
-import time
-from dataclasses import replace
+import dataclasses
+import math
 from pathlib import Path
 
 import pytest
 
-from memetrader import config, loop, quotes
-from memetrader.loop import Trader
+from memetrader import config as config_mod
+from memetrader import ids, loop, quotes, risk
+from memetrader.ids import quote_fingerprint
 from memetrader.types import (
-    CoinSnapshot,
-    FillQuote,
-    MarketSnapshot,
+    CoinSnapshot as Snap,
+)
+from memetrader.types import (
+    DataQuality,
+    EvidenceBundle,
+    ExecutionMode,
+    Fill,
+    Mark,
+    OrderIntent,
+    OrderState,
+    PoolRef,
     PriceLadder,
+    Provenance,
+    Quote,
     Side,
+    StrategyDecision,
+    TargetPosition,
+    TechnicalBrief,
+    Technicals,
+    TokenMeta,
     TxnCounts,
 )
+from memetrader.types import (
+    MarketSnapshot as MSnap,
+)
+from memetrader.types import (
+    Position as Pos,
+)
 
-MINT = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
-NOW = 1_700_000_000.0
-PRICE = 0.00002
-
-
-def make_cfg(tmp_path: Path) -> config.Config:
-    """The real config with the data dir redirected and randomness removed.
-
-    ``failed_tx_rate`` is pinned to 0 so a 6% coin flip cannot make these tests
-    flaky — the failed-transaction path has its own deterministic tests in
-    ``test_broker.py``.
-    """
-    base = config.load()
-    return replace(
-        base,
-        data_dir=tmp_path,
-        execution=replace(base.execution, failed_tx_rate=0.0, gas_usd_per_swap=0.21),
-        sentiment=replace(base.sentiment, enabled=False),
-    )
+NOW = 1_800_000_000.0
+BONK = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+USDC = TokenMeta(mint=quotes.USDC_MINT, decimals=6, source="test")
+TOKEN = TokenMeta(mint=BONK, decimals=5, source="test")
 
 
-def coin(symbol: str = "BONK", *, price_usd: float = PRICE) -> CoinSnapshot:
-    return CoinSnapshot(
-        symbol=symbol,
-        mint=MINT,
-        price_usd=price_usd,
-        liquidity_usd=250_000.0,
-        volume_24h_usd=1_000_000.0,
-        volume_1h_usd=50_000.0,
-        fdv_usd=None,
-        price_change=PriceLadder(m5=0.1, h1=0.2, h6=0.3, h24=0.4),
-        txns_m5=TxnCounts(buys=10, sells=8),
-        txns_h1=TxnCounts(buys=100, sells=90),
-        txns_h24=TxnCounts(buys=1000, sells=900),
-        pair_address="pool",
-        dex_id="raydium",
-        pair_created_at=NOW - 86_400.0,
-        candles_5m=(),
-        candles_1h=(),
-    )
-
-
-def snapshot(*coins: CoinSnapshot, ts: float | None = None) -> MarketSnapshot:
-    """Fresh by default. ``fast_tick`` reads the real clock to age the snapshot
-    against ``max_snapshot_age_seconds``, so a snapshot pinned to a fixed epoch
-    is rejected as stale before any stop-loss logic is reached."""
-    coins = coins or (coin(),)
-    return MarketSnapshot(ts=time.time() if ts is None else ts, coins={c.symbol: c for c in coins})
-
-
-def quote(
-    *, side: Side = Side.SELL, usd_notional: float = 200.0, price_usd: float = PRICE
-) -> FillQuote:
-    return FillQuote(
-        symbol="BONK",
-        mint=MINT,
-        side=side,
-        usd_notional=usd_notional,
-        price_usd=price_usd,
-        price_impact_pct=0.4,
-        route_labels=("Raydium",),
-        pool_fee_pct=0.0,
-        degraded=False,
-    )
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
-def stub_network(monkeypatch: pytest.MonkeyPatch):
-    """Pin both network boundaries. Returns the snapshot so tests can mutate it."""
-    snap = snapshot()
+def cfg(tmp_path: Path):
+    """The real config, redirected at a temp data dir.
 
-    def fake_fill_quote(cfg, symbol, mint, side, usd_notional, *, mid_price_usd, **kw):
-        # Fill at the true market price, which is what Jupiter returns — note
-        # this is deliberately *not* ``mid_price_usd``. The real ``fill_quote``
-        # uses that argument only as a hint for deriving token decimals and gets
-        # its price from the route, which is why ``_force_exit`` can safely pass
-        # a stale entry price when the snapshot is missing. A stub that filled at
-        # the hint would make that fallback look broken when it is not.
-        market_price = snap.coins[symbol].price_usd if symbol in snap.coins else mid_price_usd
-        return quote(side=side, usd_notional=usd_notional, price_usd=market_price)
-
-    monkeypatch.setattr(loop.market, "snapshot", lambda cfg, **kw: snap)
-    monkeypatch.setattr(loop.quotes, "fill_quote", fake_fill_quote)
-    return snap
-
-
-def trades(cfg: config.Config) -> list[dict]:
-    if not cfg.trades_path.is_file():
-        return []
-    return [
-        json.loads(line)
-        for line in cfg.trades_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-
-
-# ---------------------------------------------------------------------------
-# The ledger is written exactly once
-# ---------------------------------------------------------------------------
-
-
-def test_a_stop_loss_exit_writes_exactly_one_trade_row(
-    tmp_path: Path, stub_network: MarketSnapshot
-) -> None:
-    """The regression. ``place_order`` owns the trades.jsonl row; the loop must
-    not write a second one. Asserting ``== 1`` rather than ``>= 1`` is the whole
-    point of the test."""
-    cfg = make_cfg(tmp_path)
-    trader = Trader(cfg, client=object())  # type: ignore[arg-type]
-    trader.broker.place_order("BONK", Side.BUY, 200.0, quote=quote(side=Side.BUY), now=NOW)
-    assert len(trades(cfg)) == 1, "the opening buy itself should be one row"
-
-    # Halve the price: a -50% drawdown is well past the -15% stop.
-    stub_network.coins["BONK"] = coin(price_usd=PRICE / 2)
-    result = trader.fast_tick()
-
-    assert result.stop_loss_exits == ["BONK"]
-    rows = trades(cfg)
-    assert len(rows) == 2, f"expected buy + stop-loss sell, got {len(rows)} rows"
-    assert [r["side"] for r in rows] == ["BUY", "SELL"]
-
-
-def test_the_book_and_the_trade_log_agree_after_a_stop_loss(
-    tmp_path: Path, stub_network: MarketSnapshot
-) -> None:
-    """The check that the duplicate-row bug slipped past, kept as the companion
-    to the one that catches it: the book was always right, which is exactly why
-    nothing noticed the log was wrong."""
-    cfg = make_cfg(tmp_path)
-    trader = Trader(cfg, client=object())  # type: ignore[arg-type]
-    trader.broker.place_order("BONK", Side.BUY, 200.0, quote=quote(side=Side.BUY), now=NOW)
-    stub_network.coins["BONK"] = coin(price_usd=PRICE / 2)
-    trader.fast_tick()
-
-    assert trader.broker.get_positions() == {}
-    reloaded = json.loads(cfg.state_path.read_text(encoding="utf-8"))
-    assert reloaded["positions"] == {}
-    # Sum of the log equals the move in the book: paid 200 + gas, got ~100 back.
-    rows = trades(cfg)
-    net = sum(
-        (r["filled_usd"] if r["side"] == "SELL" else -r["filled_usd"]) - r["gas_usd"]
-        for r in rows
-    )
-    assert reloaded["cash_usd"] == pytest.approx(1000.0 + net, abs=0.01)
-
-
-# ---------------------------------------------------------------------------
-# Stop-losses fire through a collapsing pool
-# ---------------------------------------------------------------------------
-
-
-def test_a_stop_loss_still_exits_a_pool_below_the_liquidity_floor(
-    tmp_path: Path, stub_network: MarketSnapshot
-) -> None:
-    """The reason the forced-exit bypass was widened. A pool draining below the
-    floor is the scenario the stop exists for; blocking the exit there traps the
-    position instead of protecting it."""
-    cfg = make_cfg(tmp_path)
-    trader = Trader(cfg, client=object())  # type: ignore[arg-type]
-    trader.broker.place_order("BONK", Side.BUY, 200.0, quote=quote(side=Side.BUY), now=NOW)
-
-    collapsed = replace(coin(price_usd=PRICE / 2), liquidity_usd=900.0)
-    stub_network.coins["BONK"] = collapsed
-    result = trader.fast_tick()
-
-    assert result.stop_loss_exits == ["BONK"]
-    assert trader.broker.get_positions() == {}
-
-
-def test_a_stop_loss_is_not_blocked_by_a_missing_snapshot(
-    tmp_path: Path, stub_network: MarketSnapshot, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The mint is a config constant and the entry price is a good enough hint
-    for decimals, so losing the market read must not cost the position."""
-    cfg = make_cfg(tmp_path)
-    trader = Trader(cfg, client=object())  # type: ignore[arg-type]
-    trader.broker.place_order("BONK", Side.BUY, 200.0, quote=quote(side=Side.BUY), now=NOW)
-
-    # The market really is at half price; it is the *read* of it that failed.
-    from memetrader import portfolio
-
-    stub_network.coins["BONK"] = coin(price_usd=PRICE / 2)
-    now = time.time()
-    book = portfolio.mark(trader.broker, {"BONK": PRICE / 2}, now=now)
-    empty = MarketSnapshot(ts=now, coins={})
-    fill = trader._force_exit("BONK", empty, book, now)
-
-    assert fill is not None, "a data outage must not trap a position past its stop"
-    assert fill.side is Side.SELL
-    assert trader.broker.get_positions() == {}
-
-
-def test_a_stop_loss_is_blocked_by_a_stale_snapshot(
-    tmp_path: Path, stub_network: MarketSnapshot
-) -> None:
-    """Deliberately still enforced. The fast tick retries in 60s, so refusing
-    here costs a minute; exiting on a price we cannot vouch for costs the fill."""
-    from memetrader import portfolio
-
-    cfg = make_cfg(tmp_path)
-    trader = Trader(cfg, client=object())  # type: ignore[arg-type]
-    trader.broker.place_order("BONK", Side.BUY, 200.0, quote=quote(side=Side.BUY), now=NOW)
-
-    now = time.time()
-    book = portfolio.mark(trader.broker, {"BONK": PRICE / 2}, now=now)
-    stale = snapshot(coin(price_usd=PRICE / 2), ts=now - 600.0)
-    fill = trader._force_exit("BONK", stale, book, now)
-
-    assert fill is None
-    assert "BONK" in trader.broker.get_positions()
-    assert len(trades(cfg)) == 1, "the opening buy only — no sell row"
-
-
-# ---------------------------------------------------------------------------
-# A failed tick is not a HOLD
-# ---------------------------------------------------------------------------
-
-
-def test_a_model_failure_leaves_the_book_untouched_and_says_so(
-    tmp_path: Path, stub_network: MarketSnapshot, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A tick that never reached the model must be distinguishable from a tick
-    that chose to do nothing — otherwise an outage reads as conviction."""
-    cfg = make_cfg(tmp_path)
-    monkeypatch.setattr(
-        loop.brain, "decide", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("529 overloaded"))
-    )
-    trader = Trader(cfg, client=object())  # type: ignore[arg-type]
-    result = trader.slow_tick()
-
-    assert result.decision is None
-    assert result.error is not None and "529" in result.error
-    assert result.fills == []
-    assert trades(cfg) == []
-    assert not cfg.decisions_path.is_file(), "a failed tick must not log a decision"
-
-
-# ---------------------------------------------------------------------------
-# The decision log round-trips
-# ---------------------------------------------------------------------------
-
-
-def test_a_logged_decision_rehydrates_into_a_renderable_record(
-    tmp_path: Path, stub_network: MarketSnapshot, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Write a decision, read it back, render it into the next prompt.
-
-    This is the test that was missing. Every earlier check ran against an empty
-    ``decisions.jsonl``, so the replay path was only ever exercised on the
-    *second* slow tick of a run — where ``_record_from_row`` handed the prompt
-    renderer raw dicts and it died on ``fill.symbol``. Two ticks, not one.
+    Loading the real ``config.toml`` rather than hand-building a Config is
+    deliberate: it means these tests fail when the shipped config stops being
+    able to drive the loop, which is a failure mode a synthetic fixture hides.
     """
-    from memetrader import portfolio, prompts
-    from memetrader.types import Action, TradeDecision
+    base = config_mod.load()
+    return dataclasses.replace(base, data_dir=tmp_path, execution_mode=ExecutionMode.PAPER)
 
-    cfg = make_cfg(tmp_path)
-    decision = TradeDecision(
-        market_read="fabricated",
-        actions=[
-            Action(action="BUY", symbol="BONK", size_usd=200.0,
-                   confidence=0.8, reasoning="because"),
-        ],
+
+def _snapshot(*, price=0.00002, liquidity=5_000_000.0, ts=NOW) -> MSnap:
+    prov = Provenance(source="test", receive_time=ts, event_time=ts, quality=DataQuality.OK)
+    pool = PoolRef(
+        pair_address="pool1",
+        dex_id="raydium",
+        base_mint=BONK,
+        quote_mint=quotes.USDC_MINT,
+        quote_symbol="USDC",
+        created_at=ts - 400 * 86_400,
     )
-    monkeypatch.setattr(loop.brain, "decide", lambda *a, **kw: (decision, brain_usage()))
-
-    trader = Trader(cfg, client=object())  # type: ignore[arg-type]
-    trader.slow_tick()
-    assert cfg.decisions_path.is_file()
-
-    # Tick two: the record now comes back off disk rather than out of memory.
-    history = trader.recent_decisions()
-    assert len(history) == 1, "the decision just written must be readable"
-    record = history[0]
-    assert record.actions[0].symbol == "BONK"
-    assert record.fills and record.fills[0].symbol == "BONK"
-    assert record.fills[0].side is Side.BUY, "side must rehydrate as the enum"
-
-    # The part that actually broke: rendering it into the next user turn.
-    book = portfolio.mark(trader.broker, {"BONK": PRICE}, now=time.time())
-    text = prompts.render_user(cfg, trader.evidence(trader.snapshot()), book, history, [])
-    assert "BUY BONK" in text
-
-
-def test_the_models_thinking_reaches_the_decision_log_and_reads_back(
-    tmp_path: Path, stub_network: MarketSnapshot, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Thinking tokens are the majority of what this project spends, and the
-    field sat unpopulated — so the reasoning behind every trade was paid for and
-    then discarded, leaving the log unable to answer why a loss looked like a good
-    idea at the time."""
-    from memetrader.types import Action, TradeDecision
-
-    cfg = make_cfg(tmp_path)
-    thinking = "liquidity -12% over the interval; exiting rather than sizing down"
-    decision = TradeDecision(
-        market_read="fabricated",
-        actions=[
-            Action(action="HOLD", symbol="BONK", size_usd=0.0,
-                   confidence=0.2, reasoning="waiting"),
-        ],
+    coin = Snap(
+        symbol="BONK",
+        mint=BONK,
+        price_usd=price,
+        liquidity_usd=liquidity,
+        volume_24h_usd=9_000_000.0,
+        volume_1h_usd=400_000.0,
+        fdv_usd=1_500_000_000.0,
+        price_change=PriceLadder(m5=0.1, h1=2.0, h6=1.0, h24=3.0),
+        txns_m5=TxnCounts(buys=40, sells=30),
+        txns_h1=TxnCounts(buys=500, sells=480),
+        txns_h24=TxnCounts(buys=9000, sells=8800),
+        pool=pool,
+        provenance=prov,
     )
-    monkeypatch.setattr(
-        loop.brain, "decide", lambda *a, **kw: (decision, brain_usage(thinking=thinking))
-    )
-
-    trader = Trader(cfg, client=object())  # type: ignore[arg-type]
-    trader.slow_tick()
-
-    assert [r["thinking"] for r in decisions(cfg)] == [thinking]
-    assert trader.recent_decisions()[0].thinking == thinking
-
-    # A call that returned no thinking block at all — the API can redact it —
-    # records the absence rather than an empty string.
-    monkeypatch.setattr(loop.brain, "decide", lambda *a, **kw: (decision, brain_usage()))
-    trader.slow_tick()
-    assert decisions(cfg)[1]["thinking"] is None
-    assert trader.recent_decisions()[1].thinking is None
-
-    # Rows written before the field was populated have no key at all, and a
-    # missing thinking block is not an empty one.
-    older = {k: v for k, v in decisions(cfg)[0].items() if k != "thinking"}
-    assert loop._record_from_row(older).thinking is None
+    return MSnap(ts=ts, coins={"BONK": coin})
 
 
-# ---------------------------------------------------------------------------
-# The risk feedback channel survives a restart
-# ---------------------------------------------------------------------------
-
-
-def test_last_ticks_rejections_survive_a_restart(
-    tmp_path: Path, stub_network: MarketSnapshot, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``pending_rejections`` was in-memory only, so a restart dropped the risk
-    feedback on the one tick most likely to repeat itself: nothing in the model's
-    context says it already proposed this and was refused. Every verdict is
-    already in decisions.jsonl, so a fresh Trader over the same data dir has to
-    come up knowing them."""
-    from memetrader import portfolio, prompts
-    from memetrader.types import Action, TradeDecision
-
-    cfg = make_cfg(tmp_path)
-    # $4 is under the $10 floor, which risk.py rejects outright. A size over the
-    # position cap would be *clamped* instead, and a clamp is still an approval.
-    decision = TradeDecision(
-        market_read="fabricated",
-        actions=[
-            Action(action="BUY", symbol="BONK", size_usd=4.0,
-                   confidence=0.7, reasoning="because"),
-        ],
-    )
-    monkeypatch.setattr(loop.brain, "decide", lambda *a, **kw: (decision, brain_usage()))
-
-    trader = Trader(cfg, client=object())  # type: ignore[arg-type]
-    assert trader.pending_rejections == [], "an empty log has nothing to replay"
-    trader.slow_tick()
-    assert [v.rule for v in trader.pending_rejections] == ["min_trade_size"]
-
-    # The restart: a second Trader over the same data dir, sharing no memory.
-    restarted = Trader(cfg, client=object())  # type: ignore[arg-type]
-    assert restarted.pending_rejections == trader.pending_rejections
-    assert all(not v.approved for v in restarted.pending_rejections), (
-        "approvals are not feedback — only what was refused goes back to the model"
+def _quote(*, side: Side, in_atomic: int, out_atomic: int, ts=NOW, impact=0.2) -> Quote:
+    in_tok, out_tok = (USDC, TOKEN) if side is Side.BUY else (TOKEN, USDC)
+    return Quote(
+        symbol="BONK",
+        side=side,
+        input_token=in_tok,
+        output_token=out_tok,
+        in_amount_atomic=in_atomic,
+        out_amount_atomic=out_atomic,
+        min_out_amount_atomic=int(out_atomic * 0.995),
+        price_impact_pct=impact,
+        route_labels=("Raydium",),
+        fingerprint=quote_fingerprint(
+            side=side.value,
+            input_mint=in_tok.mint,
+            output_mint=out_tok.mint,
+            in_amount_atomic=in_atomic,
+            out_amount_atomic=out_atomic,
+            slot=None,
+        ),
+        requested_at=ts - 0.2,
+        received_at=ts,
+        expires_at=ts + 10.0,
+        reference_price_usd=0.00002,
     )
 
-    # And it has to reach the prompt, not just the attribute.
-    book = portfolio.mark(restarted.broker, {"BONK": PRICE}, now=time.time())
-    text = prompts.render_user(
+
+class FakeBroker:
+    """Records orders. Deliberately does not simulate a book."""
+
+    def __init__(self, cfg, *, mode=ExecutionMode.PAPER, positions=None, cash=1000.0):
+        self.cfg = cfg
+        self._mode = mode
+        self._positions = dict(positions or {})
+        self.cash_usd = cash
+        self.starting_cash_usd = 1000.0
+        self.realized_pnl_usd = 0.0
+        self.fees_paid_usd = 0.0
+        self.gas_paid_usd = 0.0
+        self.failed_gas_usd = 0.0
+        self.run_id = ids.new_run_id()
+        self.orders: list[tuple] = []
+        self.reconcile_calls = 0
+        self.open_intents: tuple = ()
+
+    @property
+    def mode(self):
+        return self._mode
+
+    def get_positions(self):
+        return dict(self._positions)
+
+    def reconcile(self):
+        self.reconcile_calls += 1
+        return _Recon(self.open_intents)
+
+    def place_order(self, intent, quote, *, now):
+        self.orders.append((intent, quote))
+        return Fill(
+            fill_id=ids.new_fill_id(),
+            order_id=ids.new_order_id(),
+            intent_id=intent.intent_id,
+            decision_id=intent.decision_id,
+            ts=now,
+            symbol=intent.symbol,
+            side=intent.side,
+            state=OrderState.LANDED,
+            in_amount_atomic=quote.in_amount_atomic,
+            out_amount_atomic=quote.out_amount_atomic,
+            token_amount_atomic=(
+                quote.out_amount_atomic
+                if intent.side is Side.BUY
+                else quote.in_amount_atomic
+            ),
+            token_decimals=TOKEN.decimals,
+            quote_fingerprint=quote.fingerprint,
+            price_usd=0.00002,
+            notional_usd=25.0,
+            price_impact_pct=quote.price_impact_pct,
+            pool_fee_usd=0.0,
+            gas_usd=0.21,
+        )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _Recon:
+    open_intents: tuple
+    ledger_fills: tuple = ()
+    journaled_intents: tuple = ()
+    replayed_fill_ids: tuple = ()
+
+    @property
+    def clean(self) -> bool:
+        return True
+
+
+class FixedStrategy:
+    """Returns the targets it was given. Counts how often it was asked."""
+
+    def __init__(self, targets: tuple[TargetPosition, ...]):
+        self.targets = targets
+        self.calls = 0
+
+    @property
+    def strategy_id(self) -> str:
+        return "fixed-test"
+
+    def decide(self, evidence, book, *, now):
+        self.calls += 1
+        return StrategyDecision(
+            decision_id=ids.new_decision_id(),
+            ts=now,
+            strategy_id=self.strategy_id,
+            market_read="",
+            targets=self.targets,
+            diagnostics={},
+        )
+
+
+def _technicals(*, realized_vol_pct: float | None = 45.0) -> TechnicalBrief:
+    """Just enough for the sizing rules to have something to divide by.
+
+    ``realized_vol_pct`` is the field that matters: risk sizes inversely to it
+    and refuses outright when it is None, so a fixture without it exercises the
+    refusal path rather than the sizing path. Defaulted here so tests that are
+    about something else do not have to know that.
+    """
+    # Every other field is explicitly None: "not enough history to compute this"
+    # is a claim the type makes room for, and a fixture that invents values for
+    # indicators the test does not care about would let a sizing rule quietly
+    # start depending on one.
+    fields = {
+        f.name: None
+        for f in dataclasses.fields(Technicals)
+        if f.name not in {"timeframe", "candles_used", "realized_vol_pct"}
+    }
+    h1 = Technicals(
+        timeframe="1h", candles_used=60, realized_vol_pct=realized_vol_pct, **fields
+    )
+    return TechnicalBrief(symbol="BONK", m5=None, h1=h1, flow=None)
+
+
+def _evidence(snap: MSnap, *, realized_vol_pct: float | None = 45.0):
+    return {
+        "BONK": EvidenceBundle(
+            symbol="BONK",
+            snapshot=snap.coins["BONK"],
+            technicals=_technicals(realized_vol_pct=realized_vol_pct),
+            sentiment=None,
+            sentiment_unavailable_reason="sentiment disabled",
+        )
+    }
+
+
+def _trader(
+    cfg,
+    *,
+    broker=None,
+    targets=(),
+    monkeypatch=None,
+    snap=None,
+    vol=45.0,
+    patch_evidence=True,
+):
+    broker = broker if broker is not None else FakeBroker(cfg)
+    t = loop.Trader(
         cfg,
-        restarted.evidence(restarted.snapshot()),
-        book,
-        restarted.recent_decisions(),
-        restarted.pending_rejections,
+        broker=broker,
+        strategy_impl=FixedStrategy(targets),
+        client=object(),  # never used; every network call is patched out
+        now=lambda: NOW,
     )
-    section = text.split("=== RISK VERDICTS FROM LAST TICK ===", 1)[1]
-    assert "min_trade_size" in section
-    assert "Do not re-propose them" in section
+    if monkeypatch is not None:
+        snap = snap if snap is not None else _snapshot()
+        monkeypatch.setattr(t, "snapshot", lambda **kw: snap)
+        monkeypatch.setattr(t, "token", lambda symbol, mint: TOKEN)
+        if patch_evidence:
+            monkeypatch.setattr(t, "evidence", lambda s: _evidence(s, realized_vol_pct=vol))
+    return t
 
 
 # ---------------------------------------------------------------------------
-# The liquidity window the model is shown
+# C11 — the persisted record gates trading
 # ---------------------------------------------------------------------------
 
 
-def test_the_slow_ticks_liquidity_window_is_a_decision_interval(
-    tmp_path: Path, stub_network: MarketSnapshot, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The regression for the 60-second liquidity trend.
+def test_preflight_refuses_to_trade_while_an_intent_has_no_terminal_state(cfg):
+    """An order whose outcome is unknown must stop the process, not be retried.
 
-    Both ticks used to end by assigning ``self.previous``, and the slow tick built
-    its evidence against that — so the two snapshots actually being compared were
-    one *fast* tick apart. A pool shedding 10% of its depth across a decision
-    interval reached the model as -0.7%, which reads as noise, while the prompt
-    labelled it "trend vs last tick" and the system prompt calls a draining pool
-    the single most important thing that can happen to a position.
-
-    Only the real tick sequence catches that, so this runs one: decide, fourteen
-    fast ticks, decide.
+    This is the C11 scenario end to end: place, die, restart. The successor
+    cannot distinguish "the swap landed and we crashed before writing the fill"
+    from "the swap never went out", and guessing either way is a real position
+    error. Refusing is the only answer available from inside the process.
     """
-    cfg = make_cfg(tmp_path)
-    fast = cfg.cadence.fast_tick_seconds
-    slow = cfg.cadence.slow_tick_seconds
-    start = time.time() - slow  # so the last read lands at roughly "now"
-    elapsed = 0.0
-
-    def read(_cfg, **_kw) -> MarketSnapshot:
-        return snapshot(
-            replace(coin(), liquidity_usd=draining(slow, elapsed)),
-            ts=start + elapsed,
-        )
-
-    seen: list[dict] = []
-
-    def capture(cfg_, evidence, *_a, **_kw):
-        seen.append(evidence)
-        return hold_everything(cfg_), brain_usage()
-
-    monkeypatch.setattr(loop.market, "snapshot", read)
-    monkeypatch.setattr(loop.brain, "decide", capture)
-
-    trader = Trader(cfg, client=object())  # type: ignore[arg-type]
-    trader.slow_tick()
-    for step in range(1, slow // fast):  # fourteen fast ticks, a minute apart
-        elapsed = float(step * fast)
-        trader.fast_tick()
-
-    # The two references have to diverge here — that divergence is the fix. The
-    # fast ticks carried the freshest read forward and left the baseline alone.
-    assert trader.previous is not None
-    assert trader.previous.ts == pytest.approx(start + 14 * fast)
-    assert trader.decision_baseline is not None
-    assert trader.decision_baseline.ts == pytest.approx(start)
-
-    elapsed = float(slow)
-    trader.slow_tick()
-
-    assert len(seen) == 2, "both decisions must have reached the stubbed model"
-    first = seen[0]["BONK"].technicals.flow
-    assert first.liquidity_trend_pct is None, "the first decision has no baseline"
-    assert first.liquidity_trend_seconds is None, "and so no window either"
-
-    second = seen[1]["BONK"].technicals.flow
-    # The fast tick immediately before this one read
-    # 100_000 * (1 - 0.10 * 840/900) = $90,666.67, against which $90,000 is
-    # (90_000 - 90_666.67) / 90_666.67 = -0.735%: the noise-shaped number the
-    # defect handed the model instead of the drain it was looking at.
-    assert second.liquidity_trend_pct == pytest.approx(-10.0, abs=1e-9), (
-        "a fast-tick-wide window would have reported -0.735% here"
+    broker = FakeBroker(cfg)
+    # An `OrderIntent`, not a journal `OpenIntent`: the broker's reconciliation
+    # hands back the intents it wrote and could not match to a fill, and those
+    # are the real dataclass. The ledger's `OpenIntent` summaries arrive on the
+    # other branch of the same refusal. Using the wrong one here passed a `str`
+    # where a `Side` was expected and only failed once preflight formatted it.
+    broker.open_intents = (
+        OrderIntent(
+            intent_id="int-1",
+            decision_id=None,
+            action_id=None,
+            run_id="run-0",
+            ts=NOW - 60,
+            symbol="BONK",
+            side=Side.BUY,
+            in_amount_atomic=10_000_000,
+            max_in_amount_atomic=10_000_000,
+            source="strategy",
+        ),
     )
-    assert second.liquidity_trend_seconds == pytest.approx(float(slow), abs=1e-9)
+    t = _trader(cfg, broker=broker)
+    with pytest.raises(loop.StartupRefusal) as exc:
+        t.preflight()
+    assert "int-1" in str(exc.value)
+    assert "BONK" in str(exc.value)
 
 
-def test_a_failed_model_call_does_not_move_the_liquidity_baseline(
-    tmp_path: Path, stub_network: MarketSnapshot, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A tick that never reached the model is not a decision, so it must not
-    become the thing the next decision is measured against. The next successful
-    tick then reports the drain across the whole outage — and says the window was
-    that long, instead of claiming one cadence over evidence nobody read."""
-    cfg = make_cfg(tmp_path)
-    slow = cfg.cadence.slow_tick_seconds
-    start = time.time() - 2 * slow
-    elapsed = 0.0
+def test_preflight_passes_on_a_clean_record_and_reconciles_the_broker(cfg):
+    t = _trader(cfg)
+    notes = t.preflight()
+    assert t.broker.reconcile_calls == 1
+    assert notes == ()
 
-    def read(_cfg, **_kw) -> MarketSnapshot:
-        return snapshot(
-            replace(coin(), liquidity_usd=draining(slow, elapsed)),
-            ts=start + elapsed,
-        )
 
-    seen: list[dict] = []
+# ---------------------------------------------------------------------------
+# C12 — read-only is a capability, not a flag
+# ---------------------------------------------------------------------------
 
-    def capture(cfg_, evidence, *_a, **_kw):
-        seen.append(evidence)
-        return hold_everything(cfg_), brain_usage()
 
-    monkeypatch.setattr(loop.market, "snapshot", read)
-    monkeypatch.setattr(loop.brain, "decide", capture)
+def test_read_only_mode_never_places_an_order(cfg, monkeypatch):
+    """The old --dry-run checked a boolean at some call sites and not others.
 
-    trader = Trader(cfg, client=object())  # type: ignore[arg-type]
-    trader.slow_tick()  # the baseline read
-
-    elapsed = float(slow)
+    Mode is now a property of the broker, so a read-only run cannot execute even
+    along a path that forgot to look.
+    """
+    ro = dataclasses.replace(cfg, execution_mode=ExecutionMode.READ_ONLY)
+    broker = FakeBroker(ro, mode=ExecutionMode.READ_ONLY)
+    t = _trader(
+        ro, broker=broker, targets=(TargetPosition("BONK", 25.0),), monkeypatch=monkeypatch
+    )
     monkeypatch.setattr(
-        loop.brain, "decide",
-        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("529 overloaded")),
+        quotes,
+        "quote_buy_usd",
+        lambda *a, **k: _quote(
+            side=Side.BUY, in_atomic=25_000_000, out_atomic=1_250_000_000
+        ),
     )
-    assert trader.slow_tick().error is not None
-
-    elapsed = 2.0 * slow
-    monkeypatch.setattr(loop.brain, "decide", capture)
-    trader.slow_tick()
-
-    flow = seen[-1]["BONK"].technicals.flow
-    assert flow.liquidity_trend_pct == pytest.approx(-20.0, abs=1e-9)
-    assert flow.liquidity_trend_seconds == pytest.approx(2.0 * slow, abs=1e-9)
+    result = t.slow_tick()
+    assert broker.orders == []
+    assert result.fills == ()
+    # The intent is still *formed* — a read-only run should show what it would
+    # have done, at the size it would have done it.
+    assert len(result.intents) == 1
+    assert result.intents[0].in_amount_atomic == 25_000_000
 
 
-def draining(slow: float, elapsed: float) -> float:
-    """Pool depth on a straight line from $100k to $90k across one decision
-    interval — a 10% drain, which no single 60-second step can see."""
-    return 100_000.0 * (1.0 - 0.10 * elapsed / slow)
-
-
-def decisions(cfg: config.Config) -> list[dict]:
-    if not cfg.decisions_path.is_file():
-        return []
-    return [
-        json.loads(line)
-        for line in cfg.decisions_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-
-
-def hold_everything(cfg: config.Config):
-    """One HOLD per configured coin — the only decision that leaves the book
-    exactly as it was, which is what the cadence tests want to measure against."""
-    from memetrader.types import Action, TradeDecision
-
-    return TradeDecision(
-        market_read="holding",
-        actions=[
-            Action(action="HOLD", symbol=s, size_usd=0.0, confidence=0.3, reasoning="x")
-            for s in cfg.symbols
-        ],
+def test_read_only_mode_writes_nothing_to_the_ledger(cfg, monkeypatch, tmp_path):
+    ro = dataclasses.replace(cfg, execution_mode=ExecutionMode.READ_ONLY)
+    broker = FakeBroker(ro, mode=ExecutionMode.READ_ONLY)
+    t = _trader(
+        ro, broker=broker, targets=(TargetPosition("BONK", 25.0),), monkeypatch=monkeypatch
     )
-
-
-def brain_usage(*, thinking: str | None = None):
-    from memetrader.brain import Usage
-
-    return Usage(
-        input_tokens=10, output_tokens=5,
-        cache_read_input_tokens=0, cache_creation_input_tokens=0,
-        thinking=thinking,
+    monkeypatch.setattr(
+        quotes,
+        "quote_buy_usd",
+        lambda *a, **k: _quote(
+            side=Side.BUY, in_atomic=25_000_000, out_atomic=1_250_000_000
+        ),
     )
+    t.slow_tick()
+    assert not (tmp_path / "ledger.jsonl").exists()
+
+
+def test_read_only_mode_does_not_liquidate_through_the_stop_path(cfg, monkeypatch):
+    """The specific C12 bug: the stop-loss path never consulted the dry-run flag,
+    so a 'dry' run could still close a position."""
+    ro = dataclasses.replace(cfg, execution_mode=ExecutionMode.READ_ONLY)
+    position = Pos(
+        symbol="BONK",
+        mint=BONK,
+        quantity_atomic=125_000_000_000,
+        decimals=5,
+        avg_entry_price_usd=0.00004,
+        opened_at=NOW - 3600,
+        cost_basis_usd=50.0,
+    )
+    broker = FakeBroker(ro, mode=ExecutionMode.READ_ONLY, positions={"BONK": position})
+    t = _trader(ro, broker=broker, monkeypatch=monkeypatch)
+    # Priced far below entry: the stop is unambiguously breached.
+    monkeypatch.setattr(
+        t,
+        "marks",
+        lambda snap, *, now: {
+            "BONK": Mark(
+                symbol="BONK",
+                price_usd=0.00002,
+                basis="route",
+                provenance=Provenance(source="test", receive_time=now),
+            )
+        },
+    )
+    monkeypatch.setattr(
+        quotes,
+        "quote_sell_tokens",
+        lambda *a, **k: _quote(
+            side=Side.SELL, in_atomic=125_000_000_000, out_atomic=25_000_000
+        ),
+    )
+    result = t.fast_tick()
+    assert broker.orders == []
+    assert result.fills == ()
+
+
+# ---------------------------------------------------------------------------
+# C3 — the quote binds the size
+# ---------------------------------------------------------------------------
+
+
+def test_the_order_is_quoted_at_the_risk_bounded_size_not_the_wanted_size(cfg, monkeypatch):
+    """C3: risk used to clamp a size *after* the quote and the broker then filled
+    the clamped notional against the unclamped quote — a price nobody offered
+    for that size. The bound must come first and the quote must follow it."""
+    broker = FakeBroker(cfg)
+    t = _trader(
+        cfg,
+        broker=broker,
+        targets=(TargetPosition("BONK", 500.0),),
+        monkeypatch=monkeypatch,
+    )
+    # Risk permits far less than the target asks for.
+    monkeypatch.setattr(
+        type(t.risk),
+        "entry_bounds",
+        lambda self, symbol, **kw: loop.RiskBounds(
+            symbol=symbol, side=Side.BUY, max_notional_usd=30.0, binding_rule="position_cap"
+        ),
+    )
+    seen: list[float] = []
+
+    def fake_quote(_cfg, *, usd_notional, **kw):
+        seen.append(usd_notional)
+        return _quote(
+            side=Side.BUY, in_atomic=int(usd_notional * 1_000_000), out_atomic=1_500_000_000
+        )
+
+    monkeypatch.setattr(quotes, "quote_buy_usd", fake_quote)
+    t.slow_tick()
+
+    assert seen == [30.0], "the quote must be requested at the permitted size, once"
+    intent, quote = broker.orders[0]
+    assert intent.in_amount_atomic == quote.in_amount_atomic
+    assert intent.max_in_amount_atomic == quote.in_amount_atomic
+
+
+def test_a_quote_that_fails_reconfirmation_is_not_executed(cfg, monkeypatch):
+    """``confirm_quote`` re-runs the quote-dependent rules against the quote that
+    will actually be sent. A quote acceptable at request time can be 6% impact by
+    the time it comes back, and that is a different order."""
+    broker = FakeBroker(cfg)
+    t = _trader(
+        cfg, broker=broker, targets=(TargetPosition("BONK", 25.0),), monkeypatch=monkeypatch
+    )
+    monkeypatch.setattr(
+        quotes,
+        "quote_buy_usd",
+        lambda *a, **k: _quote(
+            side=Side.BUY, in_atomic=25_000_000, out_atomic=1_250_000_000
+        ),
+    )
+    monkeypatch.setattr(
+        type(t.risk),
+        "confirm_quote",
+        lambda self, bounds, quote, **kw: dataclasses.replace(
+            bounds,
+            max_notional_usd=0.0,
+            vetoes=("price_impact",),
+            reasons=("6.1% impact at this size",),
+            binding_rule="price_impact",
+        ),
+    )
+    result = t.slow_tick()
+    assert broker.orders == []
+    assert result.fills == ()
+
+
+# ---------------------------------------------------------------------------
+# C4 — there is no such thing as a fallback quote
+# ---------------------------------------------------------------------------
+
+
+def test_no_quote_means_no_trade(cfg, monkeypatch):
+    """C4: the old code synthesised a 'degraded' quote from the mid price when
+    Jupiter was unreachable and then executed it as though a router had offered
+    it. A missing quote is a missing price."""
+    broker = FakeBroker(cfg)
+    t = _trader(
+        cfg, broker=broker, targets=(TargetPosition("BONK", 25.0),), monkeypatch=monkeypatch
+    )
+    monkeypatch.setattr(quotes, "quote_buy_usd", lambda *a, **k: None)
+    result = t.slow_tick()
+    assert broker.orders == []
+    assert result.fills == ()
+
+
+def test_unknown_token_decimals_block_the_order(cfg, monkeypatch):
+    """Without decimals every atomic amount is a guess, and a guess of 9 where
+    the answer is 5 is a 10,000x sizing error."""
+    broker = FakeBroker(cfg)
+    t = _trader(cfg, broker=broker, targets=(TargetPosition("BONK", 25.0),))
+    monkeypatch.setattr(t, "snapshot", lambda **kw: _snapshot())
+    monkeypatch.setattr(t, "token", lambda symbol, mint: None)
+    called: list[int] = []
+    monkeypatch.setattr(quotes, "quote_buy_usd", lambda *a, **k: called.append(1))
+    t.slow_tick()
+    assert called == []
+    assert broker.orders == []
+
+
+# ---------------------------------------------------------------------------
+# Targets, not orders
+# ---------------------------------------------------------------------------
+
+
+def test_a_target_already_held_produces_no_order(cfg, monkeypatch):
+    """The point of targets over actions. Under the old design the model emitting
+    'BUY $50 BONK' on two consecutive ticks opened two positions, because the
+    model had to remember the book and did not."""
+    position = Pos(
+        symbol="BONK",
+        mint=BONK,
+        quantity_atomic=125_000_000_000,
+        decimals=5,
+        avg_entry_price_usd=0.00002,
+        opened_at=NOW - 3600,
+        cost_basis_usd=25.0,
+    )
+    broker = FakeBroker(cfg, positions={"BONK": position})
+    t = _trader(
+        cfg, broker=broker, targets=(TargetPosition("BONK", 25.0),), monkeypatch=monkeypatch
+    )
+    monkeypatch.setattr(
+        t,
+        "marks",
+        lambda snap, *, now: {
+            "BONK": Mark(
+                symbol="BONK",
+                price_usd=0.00002,
+                basis="route",
+                provenance=Provenance(source="test", receive_time=now),
+            )
+        },
+    )
+    result = t.slow_tick()
+    assert broker.orders == []
+    assert result.intents == ()
+
+
+def test_a_drift_inside_the_rebalance_band_is_left_alone(cfg, monkeypatch):
+    """Rebalancing a $25 position by $5 pays gas, spread and impact to move
+    nothing. The band is a cost control, not a nicety."""
+    position = Pos(
+        symbol="BONK",
+        mint=BONK,
+        quantity_atomic=100_000_000_000,
+        decimals=5,
+        avg_entry_price_usd=0.00002,
+        opened_at=NOW - 3600,
+        cost_basis_usd=20.0,
+    )
+    broker = FakeBroker(cfg, positions={"BONK": position})
+    t = _trader(
+        cfg, broker=broker, targets=(TargetPosition("BONK", 25.0),), monkeypatch=monkeypatch
+    )
+    monkeypatch.setattr(
+        t,
+        "marks",
+        lambda snap, *, now: {
+            "BONK": Mark(
+                symbol="BONK",
+                price_usd=0.00002,
+                basis="route",
+                provenance=Provenance(source="test", receive_time=now),
+            )
+        },
+    )
+    # Held $20 against a $25 target: a $5 delta, inside the $15 band.
+    assert cfg.strategy.rebalance_band_usd > 5.0
+    t.slow_tick()
+    assert broker.orders == []
+
+
+def test_an_unmarkable_position_is_never_rebalanced_against(cfg, monkeypatch):
+    """C8 in the sizing layer. A delta computed against an unknown holding value
+    is arithmetic on a guess, and the resulting order is that guess with a dollar
+    sign in front of it."""
+    position = Pos(
+        symbol="BONK",
+        mint=BONK,
+        quantity_atomic=125_000_000_000,
+        decimals=5,
+        avg_entry_price_usd=0.00002,
+        opened_at=NOW - 3600,
+        cost_basis_usd=25.0,
+    )
+    broker = FakeBroker(cfg, positions={"BONK": position})
+    t = _trader(
+        cfg, broker=broker, targets=(TargetPosition("BONK", 0.0),), monkeypatch=monkeypatch
+    )
+    monkeypatch.setattr(
+        t,
+        "marks",
+        lambda snap, *, now: {
+            "BONK": Mark(
+                symbol="BONK",
+                price_usd=None,
+                basis="unavailable",
+                provenance=Provenance(source="test", receive_time=now),
+                reason="no route and no mid",
+            )
+        },
+    )
+    result = t.slow_tick()
+    assert "BONK" in result.portfolio.unmarkable
+    assert result.portfolio.total_value_usd is None, "an unmarkable leg must void the total"
+    assert broker.orders == []
+
+
+# ---------------------------------------------------------------------------
+# Halt behaviour
+# ---------------------------------------------------------------------------
+
+
+def test_a_halted_run_does_not_call_the_strategy(cfg, monkeypatch):
+    """Halted means exits only. Calling the strategy anyway would burn a model
+    call to produce targets that are guaranteed to be vetoed, and would write a
+    decision that never had a chance of executing."""
+    broker = FakeBroker(cfg)
+    strategy = FixedStrategy((TargetPosition("BONK", 25.0),))
+    t = loop.Trader(
+        cfg, broker=broker, strategy_impl=strategy, client=object(), now=lambda: NOW
+    )
+    monkeypatch.setattr(t, "snapshot", lambda **kw: _snapshot())
+    monkeypatch.setattr(t, "token", lambda symbol, mint: TOKEN)
+    monkeypatch.setattr(
+        type(t.risk.continuous),
+        "evaluate",
+        lambda self, **kw: loop.RiskState(
+            ts=NOW, halted=True, halt_reasons=("max drawdown 24.1% > 20%",)
+        ),
+    )
+    result = t.slow_tick()
+    assert strategy.calls == 0
+    assert result.decision is None
+    assert result.risk_state.halted
+    assert any("halted" in n for n in result.notes)
+
+
+def test_an_open_breaker_marks_data_health_bad(cfg, monkeypatch):
+    """An open circuit breaker means a vendor has failed repeatedly and is being
+    left alone. Trading through that is trading on a book marked from whatever
+    was cached — precisely the condition under which a stop cannot fire."""
+    t = _trader(cfg, monkeypatch=monkeypatch)
+    assert t._data_health_ok() is True
+    monkeypatch.setattr(
+        type(t.breaker), "open_hosts", property(lambda self: ("api.jup.ag",))
+    )
+    assert t._data_health_ok() is False
+
+
+# ---------------------------------------------------------------------------
+# Failure handling
+# ---------------------------------------------------------------------------
+
+
+def test_a_strategy_exception_is_an_error_not_a_hold(cfg, monkeypatch):
+    """A failed tick and a tick that decided to hold nothing must not render the
+    same. Conflating them is how an outage reads as a flat market afterwards."""
+
+    class Exploding(FixedStrategy):
+        def decide(self, evidence, book, *, now):
+            raise RuntimeError("boom")
+
+    t = loop.Trader(
+        cfg,
+        broker=FakeBroker(cfg),
+        strategy_impl=Exploding(()),
+        client=object(),
+        now=lambda: NOW,
+    )
+    monkeypatch.setattr(t, "snapshot", lambda **kw: _snapshot())
+    result = t.slow_tick()
+    assert result.error == "boom"
+    assert result.decision is None
+    # The decision baseline must NOT advance: the next successful tick should
+    # measure liquidity across the whole outage, not claim 15 minutes over
+    # evidence nobody read.
+    assert t.decision_baseline is None
+
+
+def test_a_broker_refusal_does_not_stop_the_loop(cfg, monkeypatch):
+    broker = FakeBroker(cfg)
+
+    def refuse(intent, quote, *, now):
+        raise loop.BrokerError("insufficient cash")
+
+    broker.place_order = refuse
+    t = _trader(
+        cfg, broker=broker, targets=(TargetPosition("BONK", 25.0),), monkeypatch=monkeypatch
+    )
+    monkeypatch.setattr(
+        quotes,
+        "quote_buy_usd",
+        lambda *a, **k: _quote(
+            side=Side.BUY, in_atomic=25_000_000, out_atomic=1_250_000_000
+        ),
+    )
+    result = t.slow_tick()
+    assert result.fills == ()
+    assert result.error is None, "a refused order is an ordinary tick outcome"
+
+
+# ---------------------------------------------------------------------------
+# Risk ledger persistence
+# ---------------------------------------------------------------------------
+
+
+def test_the_risk_ledger_survives_a_restart(cfg):
+    """Halt history in memory only means a restart clears a drawdown halt and
+    un-quarantines a symbol that just stopped out — turning a circuit breaker
+    into 'halt until someone restarts it', which is its exact opposite."""
+    ledger = risk.RiskLedger(
+        peak_value_usd=1_400.0,
+        day_start_value_usd=1_200.0,
+        day_start_ts=NOW - 3600,
+        window_start_value_usd=1_000.0,
+        window_start_ts=NOW - 86_400,
+        consecutive_failures=2,
+        quarantined_until={"BONK": NOW + 1800},
+        last_entry_ts={"BONK": NOW - 300},
+    )
+    loop._save_risk_ledger(cfg, ledger)
+    back = loop._load_risk_ledger(cfg)
+    assert back.peak_value_usd == 1_400.0
+    assert back.consecutive_failures == 2
+    assert back.quarantined_until == {"BONK": NOW + 1800}
+    assert back.last_entry_ts == {"BONK": NOW - 300}
+
+
+def test_an_unreadable_risk_ledger_starts_halted(cfg, tmp_path):
+    """NOT a silent reset to empty. An unreadable ledger means the halt history
+    is gone, and resuming as though nothing ever went wrong is the failure this
+    is trying to prevent."""
+    (tmp_path / "risk_ledger.json").write_text("{not json", encoding="utf-8")
+    back = loop._load_risk_ledger(cfg)
+    assert back.manual_halt is True
+    assert "unreadable" in (back.manual_halt_reason or "")
+
+
+def test_a_missing_risk_ledger_is_an_empty_one_not_a_halt(cfg):
+    """A first run has no history, which is a different thing from lost history."""
+    assert loop._load_risk_ledger(cfg) == risk.EMPTY_LEDGER
+
+
+# ---------------------------------------------------------------------------
+# Stops
+# ---------------------------------------------------------------------------
+
+
+def test_the_stop_price_has_exactly_one_definition(cfg, monkeypatch):
+    """There used to be three, disagreeing at the third decimal, so a position
+    could be past its stop in the fast tick and not in the slow one. The loop
+    must not recompute it — it asks ``portfolio.stop_loss_breaches``."""
+    import inspect
+
+    source = inspect.getsource(loop)
+    assert "stop_loss_breaches" in source
+    # No arithmetic on stop_loss_pct anywhere in the loop except the log message.
+    for line in source.splitlines():
+        if "stop_loss_pct" in line and "stop_loss_breaches" not in line:
+            assert (
+                "log." in line
+                or "#" in line.strip()[:1]
+                or 'f"' in line
+                or "self.cfg.risk.stop_loss_pct," in line
+            ), line
+
+
+def test_a_degraded_stop_reference_is_reported_not_hidden(cfg, monkeypatch, caplog):
+    """A stop firing against a haircut mid rather than a route quote is allowed —
+    freezing stops during an outage is the more dangerous failure on an asset
+    that gaps — but it is not the same event and must not read as one."""
+    position = Pos(
+        symbol="BONK",
+        mint=BONK,
+        quantity_atomic=125_000_000_000,
+        decimals=5,
+        avg_entry_price_usd=0.00004,
+        opened_at=NOW - 3600,
+        cost_basis_usd=50.0,
+    )
+    broker = FakeBroker(cfg, positions={"BONK": position})
+    t = _trader(cfg, broker=broker, monkeypatch=monkeypatch)
+    monkeypatch.setattr(
+        t,
+        "marks",
+        lambda snap, *, now: {
+            "BONK": Mark(
+                symbol="BONK",
+                price_usd=0.0000196,
+                basis="mid",
+                haircut_pct=2.0,
+                provenance=Provenance(source="dexscreener", receive_time=now),
+                reason="no route quote; mid haircut 2.0%",
+            )
+        },
+    )
+    monkeypatch.setattr(
+        quotes,
+        "quote_sell_tokens",
+        lambda *a, **k: _quote(
+            side=Side.SELL, in_atomic=125_000_000_000, out_atomic=24_500_000
+        ),
+    )
+    with caplog.at_level("WARNING"):
+        result = t.fast_tick()
+    assert result.stop_exits == ("BONK",)
+    assert any("mid reference" in r.getMessage() for r in caplog.records)
+
+
+def test_a_stop_exit_sells_the_exact_atomic_quantity_held(cfg, monkeypatch):
+    """Not a dollar amount, and not a rounded one. C2 was SELL quotes and ledger
+    quantities disagreeing because dollars were the unit of record; a full exit
+    must name the integer it is disposing of."""
+    position = Pos(
+        symbol="BONK",
+        mint=BONK,
+        quantity_atomic=123_456_789_100,
+        decimals=5,
+        avg_entry_price_usd=0.00004,
+        opened_at=NOW - 3600,
+        cost_basis_usd=50.0,
+    )
+    broker = FakeBroker(cfg, positions={"BONK": position})
+    t = _trader(cfg, broker=broker, monkeypatch=monkeypatch)
+    monkeypatch.setattr(
+        t,
+        "marks",
+        lambda snap, *, now: {
+            "BONK": Mark(
+                symbol="BONK",
+                price_usd=0.00002,
+                basis="route",
+                provenance=Provenance(source="test", receive_time=now),
+            )
+        },
+    )
+    seen: list[int] = []
+
+    def fake_sell(_cfg, *, token_amount_atomic, **kw):
+        seen.append(token_amount_atomic)
+        return _quote(side=Side.SELL, in_atomic=token_amount_atomic, out_atomic=24_691_357)
+
+    monkeypatch.setattr(quotes, "quote_sell_tokens", fake_sell)
+    t.fast_tick()
+    assert seen == [123_456_789_100]
+
+
+# ---------------------------------------------------------------------------
+# Scheduling
+# ---------------------------------------------------------------------------
+
+
+def test_the_scheduler_uses_a_monotonic_clock(cfg):
+    """An NTP correction moving wall time backwards used to stall the loop until
+    it caught up; moving it forwards fired every missed tick at once."""
+    import inspect
+
+    src = inspect.getsource(loop.Trader.run)
+    code = [ln for ln in src.splitlines() if not ln.strip().startswith("#")]
+    assert any("time.monotonic()" in ln for ln in code)
+    assert not any("time.time()" in ln for ln in code)
+
+
+def test_the_cadence_is_measured_from_the_deadline_not_from_completion(cfg):
+    """Scheduling the next tick relative to completion lets a run of slow ticks
+    drift the decision interval out indefinitely."""
+    import inspect
+
+    src = inspect.getsource(loop.Trader.run)
+    assert "max(mono, next_slow) + slow" in src
+
+
+# ---------------------------------------------------------------------------
+# Evidence honesty
+# ---------------------------------------------------------------------------
+
+
+def test_a_disabled_sentiment_stream_is_reported_as_unavailable_not_as_zero(
+    cfg, monkeypatch
+):
+    """'Missing is never zero' at the top of the pipeline. A disabled stream must
+    say it is disabled, so a strategy discounts rather than trading on a blank."""
+    off = dataclasses.replace(
+        cfg, sentiment=dataclasses.replace(cfg.sentiment, enabled=False)
+    )
+    t = _trader(off, monkeypatch=monkeypatch, patch_evidence=False)
+    bundles = t.evidence(_snapshot())
+    assert bundles["BONK"].sentiment is None
+    assert "disabled" in (bundles["BONK"].sentiment_unavailable_reason or "")
+
+
+def test_the_liquidity_window_is_the_real_gap_not_the_configured_cadence(cfg, monkeypatch):
+    """A long tick, a vendor outage or a restart all move it, and the trend is
+    labelled with this number. Claiming 15 minutes over a 3-hour gap would
+    misdescribe the signal the system ranks highest."""
+    t = _trader(cfg, monkeypatch=monkeypatch, patch_evidence=False)
+    old = _snapshot(ts=NOW - 10_800, liquidity=6_000_000.0)
+    t.decision_baseline = old
+    seen: list[float | None] = []
+    monkeypatch.setattr(
+        loop.signals,
+        "brief",
+        lambda snap, prev, *, elapsed_seconds: seen.append(elapsed_seconds),
+    )
+    t.evidence(_snapshot())
+    assert seen == [10_800.0]
+    assert seen[0] != cfg.cadence.slow_tick_seconds
+
+
+# ---------------------------------------------------------------------------
+# Journalling order
+# ---------------------------------------------------------------------------
+
+
+def test_the_intent_is_journaled_before_the_order_is_placed(cfg, monkeypatch, tmp_path):
+    """The intent ID is the idempotency key. If it is written after the swap, a
+    crash in between leaves a position with nothing on disk explaining it — which
+    is C11 with the two files swapped."""
+    broker = FakeBroker(cfg)
+    order_of_events: list[str] = []
+    t = _trader(
+        cfg, broker=broker, targets=(TargetPosition("BONK", 25.0),), monkeypatch=monkeypatch
+    )
+    real_append = t.ledger.append_intent
+
+    def spy_intent(intent, *, state=OrderState.PROPOSED):
+        order_of_events.append("intent")
+        return real_append(intent, state=state)
+
+    def spy_place(intent, quote, *, now):
+        order_of_events.append("place")
+        return FakeBroker.place_order(broker, intent, quote, now=now)
+
+    monkeypatch.setattr(t.ledger, "append_intent", spy_intent)
+    broker.place_order = spy_place
+    monkeypatch.setattr(
+        quotes,
+        "quote_buy_usd",
+        lambda *a, **k: _quote(
+            side=Side.BUY, in_atomic=25_000_000, out_atomic=1_250_000_000
+        ),
+    )
+    t.slow_tick()
+    assert order_of_events == ["intent", "place"]
+
+
+def test_a_landed_fill_is_journaled_and_the_intent_reaches_a_terminal_state(
+    cfg, monkeypatch, tmp_path
+):
+    broker = FakeBroker(cfg)
+    t = _trader(
+        cfg, broker=broker, targets=(TargetPosition("BONK", 25.0),), monkeypatch=monkeypatch
+    )
+    monkeypatch.setattr(
+        quotes,
+        "quote_buy_usd",
+        lambda *a, **k: _quote(
+            side=Side.BUY, in_atomic=25_000_000, out_atomic=1_250_000_000
+        ),
+    )
+    t.slow_tick()
+    rows = list(loop.journal.read(tmp_path / "ledger.jsonl"))
+    kinds = [r["kind"] for r in rows]
+    assert "intent" in kinds and "fill" in kinds and "decision" in kinds
+    # And nothing is left open.
+    assert t.ledger.open_intents() == ()
+
+
+# ---------------------------------------------------------------------------
+# Marking
+# ---------------------------------------------------------------------------
+
+
+def test_gas_on_failed_swaps_is_counted_in_the_book(cfg, monkeypatch):
+    """A failed swap still pays full gas. Reporting only successful-swap gas
+    understates the cost of exactly the condition that produces the most
+    failures."""
+    broker = FakeBroker(cfg)
+    broker.gas_paid_usd = 1.05
+    broker.failed_gas_usd = 0.63
+    t = _trader(cfg, broker=broker, monkeypatch=monkeypatch)
+    book = t.book(_snapshot(), now=NOW)
+    assert book.gas_paid_usd == pytest.approx(1.68)
+
+
+def test_a_book_with_no_positions_is_fully_marked(cfg, monkeypatch):
+    t = _trader(cfg, monkeypatch=monkeypatch)
+    book = t.book(_snapshot(), now=NOW)
+    assert book.fully_marked
+    assert book.total_value_usd == pytest.approx(1000.0)
+    assert not math.isnan(book.total_value_usd)
