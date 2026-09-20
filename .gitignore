@@ -2,6 +2,12 @@
 data/
 .env
 
+# Documented run output: the book, the decisions and the verbatim prompts of a
+# live session. Same reasoning as data/ — generated, not source, and the
+# console logs carry the internal gateway hostname.
+runs/
+.lastrun
+
 # Python
 __pycache__/
 *.py[cod]
@@ -9,3 +15,4 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/

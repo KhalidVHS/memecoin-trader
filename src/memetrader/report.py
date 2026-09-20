@@ -16,6 +16,7 @@ from rich.table import Table
 from rich.text import Text
 
 from . import journal
+from .brain import Usage
 from .config import Config
 from .types import EvidenceBundle, PortfolioState, Technicals
 
@@ -81,6 +82,20 @@ def _age(seconds: float) -> str:
     return f"{seconds / 86400:.1f}d"
 
 
+# A high-effort thinking trace runs to thousands of tokens. `report` is meant
+# to be a scannable log of the last N decisions, and one trace unrolling over
+# several screens buries the other nine — so this view shows the opening of it
+# and nothing more. The full text is never discarded; it stays in
+# decisions.jsonl, which is the place to read one decision in depth.
+_THINKING_PREVIEW_CHARS = 280
+
+
+def _clip(text: str, limit: int) -> str:
+    """One line, at most ``limit`` characters, ellipsis when cut."""
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
+
+
 # ---------------------------------------------------------------------------
 # Evidence
 # ---------------------------------------------------------------------------
@@ -121,7 +136,12 @@ def evidence_panel(bundle: EvidenceBundle) -> Panel:
     flow.append(f"${c.liquidity_usd:,.0f}")
     if bundle.technicals is not None:
         trend = bundle.technicals.flow.liquidity_trend_pct
-        flow.append("  trend ")
+        window = bundle.technicals.flow.liquidity_trend_seconds
+        # The window is printed for the same reason the prompt prints it: this
+        # number is measured against the previous *decision*, not the previous
+        # read, so its span varies with how late a tick ran or how long an
+        # outage lasted. A bare percentage invites reading it as the cadence.
+        flow.append(f"  trend/{_age(window)} " if window is not None else "  trend ")
         flow.append(_pct(trend))
         flow.append(f"   turnover24h {bundle.technicals.flow.turnover_24h:.2f}x")
     lines.append(flow)
@@ -147,8 +167,8 @@ def evidence_panel(bundle: EvidenceBundle) -> Panel:
         v24 = "n/a" if s.mention_velocity_24h is None else f"{s.mention_velocity_24h:.1f}/h"
         line = Text("  social ", style="magenta")
         line.append(
-            f"vel1h {v1}  vel24h {v24}  "
-            f"z7d {z}  contributors {s.unique_contributors_24h}  ratio {ratio}",
+            f"vel1h {v1}  vel24h {v24}  z7d {z}  "
+            f"contributors {_num(s.unique_contributors_24h, 'd')}  ratio {ratio}",
             style="magenta",
         )
         lines.append(line)
@@ -164,7 +184,16 @@ def evidence_panel(bundle: EvidenceBundle) -> Panel:
                 Text("         ^ few accounts posting a lot — shill-farm signature", style="yellow")
             )
         for p in s.top_posts[:2]:
-            lines.append(Text(f"         r/{p.subreddit} [{p.score}] {p.title[:70]}", style="dim"))
+            # Label the kind and always print text. Before comments joined the
+            # sweep this line read ``p.title[:70]``, which renders as the empty
+            # string for a comment — the row showed a subreddit and a score with
+            # no evidence beside them, silently dropping the one piece of
+            # content the operator is reading this panel for.
+            label = "c" if p.kind == "comment" else "p"
+            excerpt = " ".join(p.title.split())[:70] or "(no text)"
+            lines.append(
+                Text(f"         r/{p.subreddit} [{p.score}] ({label}) {excerpt}", style="dim")
+            )
 
     if c.degraded:
         lines.append(Text(f"  ! degraded: {c.degraded_reason}", style="yellow"))
@@ -278,6 +307,16 @@ def print_decisions(cfg: Config, limit: int = 10) -> None:
         age = _age(now - float(r.get("ts", now)))
         console.print(f"\n[bold]{age} ago[/bold]  [dim]{r.get('model')} effort={r.get('effort')}[/dim]")
         console.print(Text(f"  {r.get('market_read', '')}", style="italic dim"))
+        # `.get`, because rows written before thinking was captured have no
+        # such key and must still render rather than KeyError the whole report.
+        thinking = str(r.get("thinking") or "").strip()
+        if thinking:
+            console.print(
+                Text(
+                    f"  thinking: {_clip(thinking, _THINKING_PREVIEW_CHARS)}",
+                    style="dim",
+                )
+            )
         verdicts = r.get("verdicts") or []
         for i, a in enumerate(r.get("actions") or []):
             v = verdicts[i] if i < len(verdicts) else {}
@@ -301,20 +340,32 @@ def print_spend(cfg: Config) -> None:
     if not rows:
         console.print("[dim]no model calls yet[/dim]")
         return
-    tin = sum(int(r.get("input_tokens", 0)) for r in rows)
-    tout = sum(int(r.get("output_tokens", 0)) for r in rows)
-    tcache = sum(int(r.get("cache_read_input_tokens", 0)) for r in rows)
-    tcreate = sum(int(r.get("cache_creation_input_tokens", 0)) for r in rows)
-    cost = cfg.model.cost_usd(tin + tcreate, tout, tcache)
-    hit = 100.0 * tcache / (tin + tcache) if (tin + tcache) else 0.0
+    # Summed into a Usage rather than re-derived here, so this shares one cost
+    # formula and one cache-hit definition with `once`. Both used to differ:
+    # the cost folded cache-creation into input and billed it at 1x, and the
+    # hit rate divided by (input + cache_read) only, so the same run reported a
+    # flatteringly high rate here and a lower one from Usage.cache_hit_rate.
+    total = Usage(
+        input_tokens=sum(int(r.get("input_tokens", 0)) for r in rows),
+        output_tokens=sum(int(r.get("output_tokens", 0)) for r in rows),
+        cache_read_input_tokens=sum(
+            int(r.get("cache_read_input_tokens", 0)) for r in rows
+        ),
+        cache_creation_input_tokens=sum(
+            int(r.get("cache_creation_input_tokens", 0)) for r in rows
+        ),
+    )
+    cost = total.cost_usd(cfg)
     per_call = cost / len(rows)
     console.print(
-        f"\n[bold]Spend[/bold]  {len(rows)} calls   in {tin:,}  out {tout:,}  "
-        f"cache-read {tcache:,} ({hit:.0f}% hit)\n"
+        f"\n[bold]Spend[/bold]  {len(rows)} calls   in {total.input_tokens:,}  "
+        f"out {total.output_tokens:,}  cache-write {total.cache_creation_input_tokens:,}  "
+        f"cache-read {total.cache_read_input_tokens:,} "
+        f"({100.0 * total.cache_hit_rate:.0f}% hit)\n"
         f"  [bold]${cost:,.2f}[/bold] to date   ${per_call:.4f}/call   "
         f"≈ ${per_call * 86400 / cfg.cadence.slow_tick_seconds:,.2f}/day at this cadence"
     )
-    if tcache == 0 and len(rows) > 1:
+    if total.cache_read_input_tokens == 0 and len(rows) > 1:
         console.print(
             "[yellow]  ! zero cache reads across multiple calls — the stable prompt "
             "prefix is being invalidated, and you are paying several times over.[/yellow]"

@@ -23,7 +23,8 @@ handling them anywhere else means handling them in five places:
 from __future__ import annotations
 
 import time
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 import httpx
 

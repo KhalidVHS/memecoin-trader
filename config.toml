@@ -24,12 +24,22 @@ aliases = ["POPCAT", "popcat"]
 
 [model]
 name = "claude-opus-5"
-effort = "high"          # "low" | "medium" | "high" — a knob, not a constant
+# "low" | "medium" | "high" | "xhigh" | "max" — a knob, not a constant, and the
+# largest single lever on what this costs, because it is thinking tokens that
+# move. Set to xhigh deliberately: the evidence bundle rewards a model that
+# reasons across three disagreeing streams, which is exactly what effort buys.
+# The README's $180-250/month was measured at "high" — expect more here.
+effort = "xhigh"
 max_tokens = 8000
 # Per-million-token prices, used only to report spend in `memetrader report`.
 price_input_per_mtok = 5.0
 price_output_per_mtok = 25.0
 price_cache_read_per_mtok = 0.5
+# Writing the cache costs 1.25x base input — you pay a premium once to pay 0.1x
+# on every later tick. Worth stating as its own number rather than folding it
+# into the input rate, because a prefix that keeps getting invalidated shows up
+# as a large cache-write bill and nothing else would explain it.
+price_cache_write_per_mtok = 6.25
 
 [cadence]
 fast_tick_seconds = 60       # mark the book, enforce stops — no model call
@@ -74,9 +84,41 @@ candles_1h = 100
 
 [sentiment]
 enabled = true
-cache_ttl_seconds = 600      # sentiment moves slower than price
+# Deliberately *below* [cadence] slow_tick_seconds, so a decision tick always
+# re-fetches and never reads this cache. That is not a dead setting: sentiment
+# is fetched only from loop.evidence(), which the 15-min tick calls once — but
+# which `status` and `once --dry-run` also call, and those get run
+# interactively many times a minute. The TTL is a debounce for those, not a
+# cost control for the loop.
+#
+# Raising it above the cadence would be the wrong trade, because a cache hit is
+# lossy in a way "staleness in seconds" does not capture: _brief_from_cache
+# returns top_posts=() — titles are never written to disk, see the Reddit API
+# terms note in sentiment.py's docstring — so every hit silently strips the
+# only qualitative evidence in this stream. And the headline number,
+# mention_velocity_1h, is an acceleration; it is the single figure where ten
+# minutes stale does the most damage. A miss is cheap by comparison: one sweep
+# of the 5 subreddits below at <=6 paginated requests each, against a 100
+# req/min budget. It also loses nothing durable — the hourly history behind the
+# 7d z-score is persisted separately and is written back on every fetch.
+cache_ttl_seconds = 600
 lookback_hours = 24
 baseline_days = 7            # window for the mention z-score
+# Sweep comments as well as submissions. Submissions alone are too sparse to
+# carry signal here — 23 BONK submissions across all five subreddits in the 90
+# days to 2026-09-19, newest 14.7 days old, so a 24h window is almost always
+# zero. Measured over the 24h ending 2026-09-20 00:13 UTC: 136 submissions
+# against at least 1008 comments (7.4:1) and 103 unique authors against 498.
+#
+# Be clear about what that buys. Over that same window the matcher found 0/0/0
+# mentions in submissions and 1/0/0 in comments — it is a 7.4x larger
+# denominator, not 7.4x more signal. What it buys is a zero that means
+# something: 1008 items read with no mention is a measurement, 136 is a sample.
+#
+# Costs roughly 2x the requests per sweep; set false to halve it back. Flipping
+# this discards the affected symbols' hourly baselines, because a bucket
+# counting submissions+comments is not comparable to one counting submissions.
+include_comments = true
 subreddits = [
     "CryptoCurrency",
     "CryptoMoonShots",

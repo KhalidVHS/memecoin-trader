@@ -9,6 +9,12 @@ A **slow tick** every 15 minutes builds the full evidence bundle, calls the
 model once, runs every proposed action through ``risk.check()``, and executes
 what survives.
 
+Because the two cadences interleave, anything measured *between* reads has to
+name which cadence it belongs to. The liquidity trend the model is shown spans
+one decision interval, measured against ``decision_baseline``; measuring it
+against the freshest read of any kind — which is what this used to do — made it
+a 60-second delta wearing the decision cadence's label.
+
 State is written atomically after every mutation, so Ctrl+C or a crash resumes
 with the book intact.
 """
@@ -67,13 +73,26 @@ class Trader:
         self.broker = LocalPaperBroker(cfg)
         self._client = client
         self._owns_client = client is None
-        # Kept so signals.py can compute liquidity_trend_pct: a pool draining is
-        # the most important thing that can happen to a position, and you only
-        # see it by comparing two reads.
+        # The freshest read of any kind, fast or slow. Handed to
+        # ``market.snapshot`` as ``previous``, which documents that parameter as
+        # accepted and deliberately unused; no cross-snapshot comparison is made
+        # against this, because a fast tick overwrites it every 60 seconds.
         self.previous: MarketSnapshot | None = None
+        # What the next decision measures liquidity against: the snapshot the
+        # model last saw, one decision interval back. A pool draining is the most
+        # important thing that can happen to a position, and you only see it by
+        # comparing two reads — but when both ticks shared ``previous`` the pair
+        # being compared was 60 seconds apart, so a pool shedding 10% of its
+        # depth between decisions was shown to the model as -0.7% and read as
+        # noise.
+        self.decision_baseline: MarketSnapshot | None = None
         # Rejections from the last slow tick, fed back to the model so it learns
-        # the boundaries instead of re-proposing illegal trades.
-        self.pending_rejections: list[RiskVerdict] = []
+        # the boundaries instead of re-proposing illegal trades. Recovered from
+        # the decision log rather than starting empty: this was in-memory only,
+        # so a restart dropped the feedback on exactly the tick most likely to
+        # repeat itself, since nothing in the model's context said it had already
+        # tried and been refused.
+        self.pending_rejections: list[RiskVerdict] = self._rejections_from_log()
         self._stop = False
 
     # -- plumbing ---------------------------------------------------------
@@ -123,10 +142,17 @@ class Trader:
             reasons = dict.fromkeys(self.cfg.symbols, "sentiment disabled in config.toml")
 
         bundles: dict[str, EvidenceBundle] = {}
+        baseline = self.decision_baseline
+        # The real gap, not ``cadence.slow_tick_seconds``: a tick that ran long,
+        # a model outage or a restart all move it, and the prompt prints this
+        # number as the window the liquidity trend covers. Claiming 15 minutes
+        # over a 3-hour gap would misdescribe the one signal the system prompt
+        # ranks highest.
+        elapsed = None if baseline is None else snap.ts - baseline.ts
         for sym, coin in snap.coins.items():
-            prev = self.previous.coins.get(sym) if self.previous else None
+            prev = baseline.coins.get(sym) if baseline is not None else None
             try:
-                tech = signals.brief(coin, prev)
+                tech = signals.brief(coin, prev, elapsed_seconds=elapsed)
             except Exception as exc:
                 log.warning("%s technicals failed: %s", sym, exc)
                 tech = None
@@ -315,10 +341,21 @@ class Trader:
             model=self.cfg.model.name,
             effort=self.cfg.model.effort,
             dry_run=dry_run,
+            # Thinking tokens are the majority of what this run costs, and the
+            # field sat unpopulated — so the reasoning that drove a trade was
+            # paid for and then thrown away, leaving ``reasoning`` on each action
+            # as the only account of a loss.
+            thinking=usage.thinking,
         )
         if not dry_run:
             journal.append(self.cfg.decisions_path, record)
         self.previous = snap
+        # Advanced only on a tick that reached the model. The early return above
+        # leaves it alone on purpose: a tick that died before the model call is
+        # not a decision, so the next successful tick measures liquidity across
+        # the whole outage and prints that longer window, rather than reporting
+        # 15 minutes over evidence nobody ever read.
+        self.decision_baseline = snap
         return result
 
     def _apply(
@@ -406,6 +443,30 @@ class Trader:
                 log.warning("skipping unreadable decision-log row: %s", exc)
         return out
 
+    def _rejections_from_log(self) -> list[RiskVerdict]:
+        """Last tick's rejections, read back off ``decisions.jsonl``.
+
+        Deliberately not a file of its own. Every verdict is already in the
+        decision log, approved or not — that is the point of logging rejections —
+        so a second file would be a duplicate of facts already on disk plus a new
+        way for the two to disagree. The only state it could hold that this
+        cannot is a dry run's verdicts, and a dry run is defined by writing
+        nothing.
+        """
+        rows = journal.tail(self.cfg.decisions_path, 1)
+        if not rows:
+            return []
+        try:
+            record = _record_from_row(rows[0])
+        except Exception as exc:
+            # Starting with an empty feedback channel is survivable; starting
+            # with a broken one is not. Same reasoning as recent_decisions: loud,
+            # because the symptom is the model re-proposing a rejected trade with
+            # nothing in the log explaining why it forgot.
+            log.warning("could not recover last tick's rejections: %s", exc)
+            return []
+        return [v for v in record.verdicts if not v.approved]
+
     # -- the loop ---------------------------------------------------------
 
     def run(self, *, max_slow_ticks: int | None = None, on_tick=None) -> None:
@@ -470,6 +531,11 @@ def _record_from_row(row: dict) -> DecisionRecord:
     """
     from .types import Action, Fill
 
+    # Rows written before ``thinking`` was populated have no key at all, and an
+    # absent thinking block is not an empty one — ``str(row.get(...))`` would turn
+    # every historical row into a record claiming the model thought nothing.
+    thinking = row.get("thinking")
+
     return DecisionRecord(
         ts=float(row.get("ts", 0.0)),
         market_read=str(row.get("market_read", "")),
@@ -488,4 +554,5 @@ def _record_from_row(row: dict) -> DecisionRecord:
         model=str(row.get("model", "")),
         effort=str(row.get("effort", "")),
         dry_run=bool(row.get("dry_run", False)),
+        thinking=None if thinking is None else str(thinking),
     )

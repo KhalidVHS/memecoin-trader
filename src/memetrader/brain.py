@@ -70,20 +70,59 @@ class ModelOutputError(BrainError):
     """The call returned, but there is no usable decision in it."""
 
 
+# Thinking arrives as *content blocks*, not as a field on the response. Read
+# from the installed anthropic 1.7.0 type definitions on 2026-09-19:
+# ``ParsedMessage.content`` is a list discriminated on ``type``, and the
+# ``thinking`` variant carries the text on ``.thinking``. Adaptive thinking may
+# emit more than one such block, so they are concatenated rather than indexed.
+_REDACTED_THINKING = "[redacted_thinking: encrypted by the API, unreadable here]"
+
+
+def _thinking_from_response(response: Any) -> str | None:
+    """The model's reasoning for this call, or ``None`` if it did not think.
+
+    A ``redacted_thinking`` block contributes a marker rather than its ``.data``,
+    which is ciphertext: writing that into every row of ``decisions.jsonl``
+    would cost real disk for bytes nobody can read. It must not collapse to
+    ``None`` either — "the model did not think" and "the model thought and we
+    are not allowed to see it" are different events, the same distinction this
+    module already draws between a skipped tick and a HOLD.
+    """
+    parts: list[str] = []
+    for block in getattr(response, "content", None) or ():
+        kind = getattr(block, "type", None)
+        if kind == "thinking":
+            text = str(getattr(block, "thinking", "") or "").strip()
+            if text:
+                parts.append(text)
+        elif kind == "redacted_thinking":
+            parts.append(_REDACTED_THINKING)
+    return "\n\n".join(parts) or None
+
+
 @dataclass(frozen=True, slots=True)
 class Usage:
-    """Token counts for one call, in the shape ``DecisionRecord`` wants.
+    """What one call cost and what the model was thinking, in the shape
+    ``DecisionRecord`` wants.
 
-    Surfaced from day one so the cost of the run is visible in
+    Token counts are surfaced from day one so the cost of the run is visible in
     ``decisions.jsonl`` rather than on next month's invoice — and so a cache
     regression (``cache_read_input_tokens`` collapsing to zero) shows up in the
     log instead of silently multiplying the bill.
+
+    ``thinking`` rides here rather than in a third return value because
+    ``decide()``'s ``tuple[TradeDecision, Usage]`` is unpacked by ``loop.py``
+    and by the tests; widening that tuple would break both. It belongs
+    alongside the counts anyway: on ``effort = "high"`` the reasoning is most of
+    what the output tokens were spent on, so the field that explains a bad trade
+    and the field that explains the bill are the same purchase.
     """
 
     input_tokens: int = 0
     output_tokens: int = 0
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
+    thinking: str | None = None
 
     @property
     def total_input_tokens(self) -> int:
@@ -100,15 +139,26 @@ class Usage:
         return self.cache_read_input_tokens / total if total else 0.0
 
     def cost_usd(self, cfg: Config) -> float:
+        """Every token this call billed for, priced once.
+
+        This used to pass only ``input_tokens`` and so charged nothing at all
+        for cache *creation*, which bills above the base input rate — it
+        understated the first call against any fresh prefix, which is exactly
+        the call a cache regression makes you pay over and over.
+        """
         return cfg.model.cost_usd(
-            self.input_tokens, self.output_tokens, self.cache_read_input_tokens
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_read_input_tokens,
+            self.cache_creation_input_tokens,
         )
 
     @classmethod
     def from_response(cls, response: Any) -> Usage:
+        thinking = _thinking_from_response(response)
         u = getattr(response, "usage", None)
         if u is None:
-            return cls()
+            return cls(thinking=thinking)
         return cls(
             input_tokens=int(getattr(u, "input_tokens", 0) or 0),
             output_tokens=int(getattr(u, "output_tokens", 0) or 0),
@@ -118,6 +168,7 @@ class Usage:
             cache_creation_input_tokens=int(
                 getattr(u, "cache_creation_input_tokens", 0) or 0
             ),
+            thinking=thinking,
         )
 
 
@@ -213,12 +264,29 @@ def decide(
             max_tokens=cfg.model.max_tokens,
             system=system,
             messages=[{"role": "user", "content": user}],
-            # Adaptive thinking is the only on-mode on Opus 5; `budget_tokens`
-            # is rejected with a 400 on this model family. Depth is controlled
-            # by effort below, not by a token budget.
+            # Checked against the installed anthropic 1.7.0 on 2026-09-19 by
+            # reading the SDK, *not* by a live call — no API key was reachable,
+            # so nothing below is confirmed against the server yet.
+            #
+            # `ThinkingConfigParam` is a three-way union: enabled, disabled,
+            # adaptive. `budget_tokens` is a key of the *enabled* variant only,
+            # so {"type": "adaptive", "budget_tokens": N} is not expressible —
+            # depth here is controlled by effort, not by a token budget. Still
+            # unverified: whether enabled+budget_tokens 400s on this model
+            # family. The SDK does not settle it. Its
+            # MODELS_TO_WARN_WITH_THINKING_ENABLED list — the models for which
+            # it warns that enabled is deprecated in favour of adaptive — holds
+            # only claude-opus-4-6 and claude-mythos-preview, so for
+            # claude-opus-5 the SDK neither warns nor blocks. Replace this
+            # paragraph the first time a real call proves it either way.
             thinking={"type": "adaptive"},
-            # `effort` lives inside output_config; messages.parse merges the
-            # TradeDecision json_schema into the same object as "format".
+            # Confirmed in the same pass: `effort` is a key of
+            # `OutputConfigParam`, and `Messages.parse` merges the generated
+            # TradeDecision schema into this very dict — literally
+            # {**output_config, "format": transformed_output_format} — so
+            # passing both is the supported combination, not a collision.
+            # Note the SDK's effort literal is low|medium|high|xhigh|max, two
+            # wider than config.py's allowlist; see the note there.
             output_config={"effort": cfg.model.effort},
             output_format=TradeDecision,
         )

@@ -208,11 +208,10 @@ def _render_tick(result: TickResult, cfg) -> None:
     report.print_portfolio(result.portfolio, cfg)
     if result.usage:
         u = result.usage
-        cost = cfg.model.cost_usd(
-            u.input_tokens + u.cache_creation_input_tokens,
-            u.output_tokens,
-            u.cache_read_input_tokens,
-        )
+        # Through Usage.cost_usd, not a second hand-rolled sum: this call site
+        # used to fold cache-creation into input_tokens and so priced it at 1x
+        # instead of 1.25x.
+        cost = u.cost_usd(cfg)
         console.print(
             f"[dim]tokens in {u.input_tokens:,} out {u.output_tokens:,} "
             f"cache-read {u.cache_read_input_tokens:,} · ${cost:.4f}[/dim]"

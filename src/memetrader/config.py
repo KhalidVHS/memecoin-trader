@@ -19,6 +19,12 @@ class ConfigError(ValueError):
     """Raised at startup when config.toml is wrong. Always fatal."""
 
 
+#: Ordered cheapest to most expensive, which is also least to most thinking.
+#: Kept as a tuple rather than a set so the error message lists them in an
+#: order that tells the reader which direction costs money.
+_EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+
+
 @dataclass(frozen=True, slots=True)
 class CoinConfig:
     symbol: str
@@ -34,12 +40,33 @@ class ModelConfig:
     price_input_per_mtok: float
     price_output_per_mtok: float
     price_cache_read_per_mtok: float
+    price_cache_write_per_mtok: float
 
-    def cost_usd(self, input_tokens: int, output_tokens: int, cache_read: int) -> float:
+    def cost_usd(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read: int,
+        cache_write: int,
+    ) -> float:
+        """The whole bill for one call. The only cost formula in the codebase.
+
+        There were three of these before 2026-09-19 and none was right: this
+        one had no cache-write price at all, ``brain.Usage.cost_usd`` passed
+        only ``input_tokens``, and the two display call sites folded
+        cache-creation into ``input_tokens`` and so billed it at 1x. Every one
+        of them understated the bill in a different direction.
+
+        ``cache_write`` is deliberately required rather than defaulted to 0.
+        The single failure this method has actually suffered is a caller
+        forgetting that cache-creation tokens exist, and a default is how that
+        happens silently.
+        """
         return (
             input_tokens * self.price_input_per_mtok
             + output_tokens * self.price_output_per_mtok
             + cache_read * self.price_cache_read_per_mtok
+            + cache_write * self.price_cache_write_per_mtok
         ) / 1_000_000
 
 
@@ -108,6 +135,19 @@ class SentimentConfig:
     reddit_client_id: str | None
     reddit_client_secret: str | None
     reddit_user_agent: str
+    # Submissions alone measured almost nothing: across the five subreddits
+    # below, the 90 days ending 2026-09-19 held 23 BONK submissions, newest 14.7
+    # days old. Comments outrun submissions 7.4:1 on the same subreddits
+    # (136 vs >=1008 over the 24h ending 2026-09-20 00:13 UTC), and a comment
+    # sample contained a BONK mention no submission did. What that buys is a
+    # credible zero rather than more mentions — the same window matched 0/0/0
+    # coins in submissions and 1/0/0 in comments. It roughly doubles the
+    # request count against a host that rate-limits, hence the switch.
+    #
+    # Defaulted, unlike its neighbours, because a required field here would
+    # break every positional ``SentimentConfig(...)`` in the tests — which is
+    # exactly how the ``ModelConfig`` cache-write field broke them once already.
+    include_comments: bool = True
 
     @property
     def has_reddit_credentials(self) -> bool:
@@ -208,8 +248,16 @@ def load(path: Path | None = None) -> Config:
 
     m = raw.get("model", {})
     effort = str(m.get("effort", "high")).lower()
-    if effort not in {"low", "medium", "high"}:
-        raise ConfigError(f"[model] effort must be low|medium|high, got {effort!r}")
+    # The full set anthropic 1.7.0's OutputConfigParam accepts, read from the
+    # installed package on 2026-09-19 rather than from docs. Deliberately not
+    # narrower: a value the API would accept should not fail here as though it
+    # were a typo. The cost consequence is real and is stated in the README —
+    # the $180-250/month figure was calibrated at "high", and effort is the
+    # single largest lever on it, because it is thinking tokens that move.
+    if effort not in _EFFORT_LEVELS:
+        raise ConfigError(
+            f"[model] effort must be one of {'|'.join(_EFFORT_LEVELS)}, got {effort!r}"
+        )
     model = ModelConfig(
         name=str(m.get("name", "claude-opus-5")),
         effort=effort,
@@ -217,6 +265,7 @@ def load(path: Path | None = None) -> Config:
         price_input_per_mtok=float(m.get("price_input_per_mtok", 5.0)),
         price_output_per_mtok=float(m.get("price_output_per_mtok", 25.0)),
         price_cache_read_per_mtok=float(m.get("price_cache_read_per_mtok", 0.5)),
+        price_cache_write_per_mtok=float(m.get("price_cache_write_per_mtok", 6.25)),
     )
 
     c = raw.get("cadence", {})
@@ -277,6 +326,7 @@ def load(path: Path | None = None) -> Config:
         lookback_hours=int(s.get("lookback_hours", 24)),
         baseline_days=int(s.get("baseline_days", 7)),
         subreddits=tuple(str(x) for x in s.get("subreddits", [])),
+        include_comments=bool(s.get("include_comments", True)),
         reddit_client_id=os.environ.get("REDDIT_CLIENT_ID") or None,
         reddit_client_secret=os.environ.get("REDDIT_CLIENT_SECRET") or None,
         reddit_user_agent=os.environ.get("REDDIT_USER_AGENT")

@@ -9,6 +9,7 @@ mechanics, so the resulting P&L means something.
 ```bash
 uv sync
 cp .env.example .env          # optional — see below
+uv run memetrader check       # config, mints and credentials — no model call
 uv run memetrader status      # live prices + technicals + sentiment, no model call
 uv run memetrader once --dry-run
 uv run memetrader run
@@ -22,6 +23,7 @@ them.
 
 | Command | What it does |
 |---|---|
+| `memetrader check` | Validates `config.toml`, resolves every configured mint to its live DexScreener pool, and reports whether the Anthropic, Reddit and Jupiter credentials are set. Run this first — a mint that is wrong, or whose pool has since migrated, fails here in a second rather than as a strange fill three hours into a run. |
 | `memetrader status` | All three evidence streams for every coin. No model call, no cost. |
 | `memetrader once --dry-run` | One full decision cycle printed end to end — evidence, the model's reasoning, proposed actions, risk verdicts — **without mutating state**. The main development loop. |
 | `memetrader once` | The same, applied. |
@@ -93,7 +95,10 @@ the fill and cost model is a config value, not a constant.
 ## Cost
 
 At a 15-minute cadence, `claude-opus-5` with `effort = "high"` is roughly
-**$180–250/month** run continuously, most of it thinking tokens. Every decision
+**$180–250/month** run continuously, most of it thinking tokens. The shipped
+default is `xhigh`, which buys more reasoning across three disagreeing evidence
+streams and costs correspondingly more — effort is the largest single lever on
+the bill, precisely because it is the thinking tokens that move. Every decision
 row records input, output and cache-read tokens, and `memetrader report` sums
 spend to date — you will know what it costs from the first day rather than from
 the invoice.
@@ -101,8 +106,10 @@ the invoice.
 Running in bursts is the cheapest way to keep this in the tens of dollars, and
 costs nothing in code: the loop resumes cleanly from `state.json`.
 
-`model` and `effort` are config values, so comparing `medium` against `high` in
-the decision log is a one-line change.
+`model` and `effort` are config values and every decision row records which
+produced it, so comparing `high` against `xhigh` in the decision log is a
+one-line change. The accepted levels are `low`, `medium`, `high`, `xhigh` and
+`max` — exactly what the API accepts, so nothing valid is rejected as a typo.
 
 ## Optional credentials
 

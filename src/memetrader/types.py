@@ -190,7 +190,13 @@ class FlowBrief:
     turnover_24h: float  # volume_24h / liquidity
     turnover_1h: float
     liquidity_usd: float
-    liquidity_trend_pct: float | None  # vs the previous snapshot; None on first
+    liquidity_trend_pct: float | None  # vs one decision ago; None on the first
+    # How far apart the two compared reads actually were. Carried because the
+    # percentage above cannot be read without it: -6% is a wobble over a day and
+    # an exit signal over a quarter of an hour. Set only when
+    # ``liquidity_trend_pct`` is, so no consumer can print a window for a trend
+    # that was never measured.
+    liquidity_trend_seconds: float | None
     price_ladder: PriceLadder
 
 
@@ -211,10 +217,20 @@ class TechnicalBrief:
 
 @dataclass(frozen=True, slots=True)
 class TopPost:
+    """One piece of raw evidence behind a sentiment brief, shown to the model.
+
+    ``title`` holds a submission's title or, for a comment, an excerpt of its
+    body — a comment has no title and inventing one would put a fabrication in
+    front of the model and in the terminal report. ``kind`` is what consumers
+    render to tell the two apart, and is trailing and defaulted so existing
+    positional construction keeps working.
+    """
+
     title: str
     score: int
     age_hours: float
     subreddit: str
+    kind: Literal["submission", "comment"] = "submission"
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,7 +255,10 @@ class SentimentBrief:
     mention_velocity_1h: float | None  # mentions/hour over the last hour
     mention_velocity_24h: float | None  # mentions/hour over the observed window
     mention_zscore_7d: float | None  # is current attention unusual for this coin
-    unique_contributors_24h: int
+    # Optional for the same reason the velocities are: on a sweep that read
+    # nothing, "0 unique contributors" is the bearish claim "nobody is talking
+    # about this coin" manufactured out of a failed read.
+    unique_contributors_24h: int | None
     contributor_to_post_ratio: float | None  # low = few accounts posting a lot
 
     top_posts: tuple[TopPost, ...] = ()

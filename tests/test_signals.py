@@ -516,6 +516,46 @@ def test_liquidity_trend_is_a_whole_percent_against_the_previous_snapshot():
     assert flow_brief(snapshot(), snapshot(liquidity=0.0)).liquidity_trend_pct is None
 
 
+def test_liquidity_trend_carries_the_window_it_was_measured_over():
+    """The percentage is unreadable without the window: -6% is a wobble over a
+    day and an exit over a quarter of an hour. The caller supplies the gap
+    because only the caller knows which of its two cadences produced the pair."""
+    previous = snapshot(liquidity=100_000.0)
+    drained = flow_brief(snapshot(liquidity=94_000.0), previous, elapsed_seconds=880.0)
+    assert drained.liquidity_trend_pct == pytest.approx(-6.0)
+    assert drained.liquidity_trend_seconds == pytest.approx(880.0)
+
+    # The same two reads 60 seconds apart are the same percentage over a wholly
+    # different window, and the brief has to be able to say so.
+    fast = flow_brief(snapshot(liquidity=94_000.0), previous, elapsed_seconds=60.0)
+    assert fast.liquidity_trend_pct == pytest.approx(-6.0)
+    assert fast.liquidity_trend_seconds == pytest.approx(60.0)
+
+
+def test_the_liquidity_window_is_none_whenever_the_trend_is():
+    """Missing is never zero, and a window without a trend is worse than either:
+    "stable over 15m" is a claim, and one point of data does not support it."""
+    alone = flow_brief(snapshot())
+    assert alone.liquidity_trend_pct is None
+    assert alone.liquidity_trend_seconds is None
+
+    # An elapsed time offered with no baseline to pair it with is still no trend.
+    orphan = flow_brief(snapshot(), None, elapsed_seconds=900.0)
+    assert orphan.liquidity_trend_pct is None
+    assert orphan.liquidity_trend_seconds is None
+
+    # A zero-liquidity baseline yields no percentage, so it yields no window.
+    undefined = flow_brief(snapshot(), snapshot(liquidity=0.0), elapsed_seconds=900.0)
+    assert undefined.liquidity_trend_pct is None
+    assert undefined.liquidity_trend_seconds is None
+
+    # And a comparison the caller could not time reports the trend without
+    # inventing a window for it.
+    untimed = flow_brief(snapshot(liquidity=75_000.0), snapshot(liquidity=100_000.0))
+    assert untimed.liquidity_trend_pct == pytest.approx(-25.0)
+    assert untimed.liquidity_trend_seconds is None
+
+
 # ---------------------------------------------------------------------------
 # brief()
 # ---------------------------------------------------------------------------
@@ -546,3 +586,13 @@ def test_brief_without_candles_is_all_none_but_still_has_flow():
     assert out.h1.candles_used == 0
     assert out.m5.rsi14 is None
     assert out.flow.liquidity_trend_pct == pytest.approx(100.0)
+
+
+def test_brief_passes_the_liquidity_window_through_to_the_flow():
+    out = brief(
+        snapshot(liquidity=120_000.0),
+        previous=snapshot(liquidity=100_000.0),
+        elapsed_seconds=900.0,
+    )
+    assert out.flow.liquidity_trend_pct == pytest.approx(20.0)
+    assert out.flow.liquidity_trend_seconds == pytest.approx(900.0)

@@ -379,12 +379,25 @@ def technicals(candles: Sequence[Candle], timeframe: Timeframe) -> Technicals:
     )
 
 
-def flow_brief(snap: CoinSnapshot, previous: CoinSnapshot | None = None) -> FlowBrief:
+def flow_brief(
+    snap: CoinSnapshot,
+    previous: CoinSnapshot | None = None,
+    *,
+    elapsed_seconds: float | None = None,
+) -> FlowBrief:
     """On-chain flow, mostly passed straight through from DexScreener.
 
     These numbers have no traditional-TA analogue and for this asset class they
     are arguably the highest-signal evidence available, because they are actual
     money moving rather than talk about money moving.
+
+    ``previous`` is whichever earlier read the caller wants liquidity measured
+    against, and ``elapsed_seconds`` is how far back that read is. The caller
+    owns both because only the caller knows its own cadence: ``loop.py`` used to
+    hand this the snapshot from 60 seconds ago while the prompt labelled the
+    result "trend vs last tick", so a pool draining 10% across a 15-minute
+    decision interval reached the model as -0.7% — noise, against a system
+    prompt that ranks a draining pool above every other signal in the system.
     """
     liquidity = snap.liquidity_usd
 
@@ -402,10 +415,17 @@ def flow_brief(snap: CoinSnapshot, previous: CoinSnapshot | None = None) -> Flow
     # memecoin position, and price alone will not show it until the exit is
     # already gone. None on the first tick — there is no trend from one point.
     liquidity_trend_pct = None
+    liquidity_trend_seconds = None
     if previous is not None and previous.liquidity_usd > 0.0:
         liquidity_trend_pct = _finite(
             (liquidity - previous.liquidity_usd) / previous.liquidity_usd * 100.0
         )
+        # The window is attached to the percentage rather than reported on its
+        # own, so a caller can never render an interval next to a trend that was
+        # not measured — "stable over 15m" is a claim, and an absent trend is
+        # not.
+        if liquidity_trend_pct is not None:
+            liquidity_trend_seconds = _finite(elapsed_seconds)
 
     # TxnCounts.ratio is intentionally allowed to be inf (buys with zero sells);
     # it is reported as-is and never used as a divisor here.
@@ -417,11 +437,17 @@ def flow_brief(snap: CoinSnapshot, previous: CoinSnapshot | None = None) -> Flow
         turnover_1h=turnover_1h,
         liquidity_usd=liquidity,
         liquidity_trend_pct=liquidity_trend_pct,
+        liquidity_trend_seconds=liquidity_trend_seconds,
         price_ladder=snap.price_change,
     )
 
 
-def brief(snap: CoinSnapshot, previous: CoinSnapshot | None = None) -> TechnicalBrief:
+def brief(
+    snap: CoinSnapshot,
+    previous: CoinSnapshot | None = None,
+    *,
+    elapsed_seconds: float | None = None,
+) -> TechnicalBrief:
     """The full technical picture for one coin: 5m, 1h and flow.
 
     Both timeframes are always present, even when their candle lists are empty —
@@ -432,7 +458,7 @@ def brief(snap: CoinSnapshot, previous: CoinSnapshot | None = None) -> Technical
         symbol=snap.symbol,
         m5=technicals(snap.candles_5m, Timeframe.M5),
         h1=technicals(snap.candles_1h, Timeframe.H1),
-        flow=flow_brief(snap, previous),
+        flow=flow_brief(snap, previous, elapsed_seconds=elapsed_seconds),
     )
 
 

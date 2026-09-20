@@ -14,6 +14,7 @@ that decides whether this design costs $3/day or $30/day.
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -146,6 +147,9 @@ def _flow() -> FlowBrief:
         turnover_1h=0.34,
         liquidity_usd=1_200_000.0,
         liquidity_trend_pct=-6.2,
+        # A decision interval that ran 60 seconds late, so the rendered window
+        # has to come from this number rather than from the configured cadence.
+        liquidity_trend_seconds=840.0,
         price_ladder=PriceLadder(m5=-0.41, h1=2.3, h6=-1.1, h24=8.4),
     )
 
@@ -400,6 +404,68 @@ def test_all_none_price_ladder_renders_entirely_na(
     for line in changes:
         assert line.strip() == "change     m5 n/a  h1 n/a  h6 n/a  h24 n/a", line
         assert "0.0" not in line
+
+
+def test_the_liquidity_trend_names_the_window_it_covers(
+    cfg, evidence, portfolio, history, rejections
+):
+    """A liquidity percentage with no window attached is unreadable, and this line
+    used to attach the wrong one: it said "trend vs last tick", which reads as the
+    15-minute decision cadence the model is told it wakes up on, while the number
+    behind it was the delta since a fast tick 60 seconds earlier."""
+    text = render_user(cfg, evidence, portfolio, history, rejections)
+    line = next(ln for ln in text.splitlines() if ln.strip().startswith("liquidity"))
+
+    # The fixture's gap is 840s, which _age formats as 14m — so what is printed
+    # is the interval that was measured and not the configured cadence restated.
+    assert "trend over 14m -6.20%" in line
+    assert "vs last tick" not in text
+    assert "a draining pool outranks everything else here" in line
+
+
+def test_a_missing_liquidity_trend_renders_na_and_never_a_zero(
+    cfg, evidence, portfolio
+):
+    """The first decision of a run has nothing to compare against, so there is
+    neither a trend nor a window. A fabricated 0.00% would claim a perfectly
+    stable pool — the opposite of an absence of information — against a system
+    prompt that ranks a draining pool above every other signal it is given."""
+    symbol = cfg.symbols[0]
+    bundle = evidence[symbol]
+    flow = replace(
+        bundle.technicals.flow,
+        liquidity_trend_pct=None,
+        liquidity_trend_seconds=None,
+    )
+    first_tick = {
+        symbol: replace(bundle, technicals=replace(bundle.technicals, flow=flow))
+    }
+
+    text = render_user(cfg, first_tick, portfolio, [], [])
+    line = next(ln for ln in text.splitlines() if ln.strip().startswith("liquidity"))
+
+    assert "trend n/a" in line
+    assert "NOT a stable pool" in line, "n/a here must not read as flat"
+    assert "0.0" not in line and "0.00" not in line
+
+
+def test_a_stretched_liquidity_window_is_rendered_as_the_real_gap(
+    cfg, evidence, portfolio
+):
+    """After a run of failed model calls the two compared reads are hours apart.
+    The window follows the measurement, so the line widens instead of restating
+    the cadence: -6.2% over three hours is a different trade from -6.2% over
+    fifteen minutes."""
+    symbol = cfg.symbols[0]
+    bundle = evidence[symbol]
+    flow = replace(bundle.technicals.flow, liquidity_trend_seconds=10_800.0)
+    stretched = {
+        symbol: replace(bundle, technicals=replace(bundle.technicals, flow=flow))
+    }
+
+    text = render_user(cfg, stretched, portfolio, [], [])
+    line = next(ln for ln in text.splitlines() if ln.strip().startswith("liquidity"))
+    assert "trend over 3.0h -6.20%" in line
 
 
 def test_history_is_capped_at_config_limit(

@@ -67,7 +67,7 @@ def make_config(tmp_path: Path, **sentiment_overrides) -> Config:
         data_dir=tmp_path,
         starting_cash_usd=1000.0,
         coins=(WIF, BONK),
-        model=ModelConfig("claude-opus-5", "high", 8000, 5.0, 25.0, 0.5),
+        model=ModelConfig("claude-opus-5", "high", 8000, 5.0, 25.0, 0.5, 6.25),
         cadence=CadenceConfig(60, 900),
         risk=RiskConfig(0.3, 0.15, 10.0, 3.0, 90.0, 50_000.0),
         execution=ExecutionConfig(50.0, 0.21, 0.06, 0.25, {}),
@@ -207,6 +207,38 @@ class TestAliasMatching:
 
     def test_empty_aliases_match_nothing(self):
         assert not S.alias_pattern(()).search("WIF BONK anything")
+
+    def test_real_indexed_titles_match(self):
+        """Titles pulled from Arctic Shift on 2026-09-19 by searching the five
+        configured subreddits over 90 days. All 24 submissions the index holds
+        for these coins were matched by this pattern, 24/24 — which is what
+        rules the matcher out as the cause of a zero-mention sweep.
+        """
+        bonk = S.alias_pattern(BONK.aliases)
+        assert bonk.search("Anyone seen BONK tanking?")
+        assert bonk.search("Heard of the BONK DAO Exploit? | A Funny, Straightforward One")
+        # ``_`` is deliberately not a fence, which is the entire reason for
+        # lookarounds over ``\b``: "Bonk_inu" is a mention, "Bonkplay" is not.
+        assert bonk.search("Bonk_inu Launched Bonkplay With Over $1m In Rewards")
+        assert not bonk.search("Bonkplay launched with rewards")
+        assert S.alias_pattern(("POPCAT", "popcat")).search("Popke meme, predates Popcat")
+
+    def test_the_live_corpus_that_matched_nothing_really_contains_nothing(self):
+        """Real titles from the 2026-09-19 sweep, which returned 143 posts and
+        zero matches for all three coins. A naive substring scan of that whole
+        41 KB corpus found no "bonk", "wif" or "popcat" either, so the zero is
+        the corpus and not the pattern.
+        """
+        titles = [
+            "Robux has to move right??!",
+            "Solana up 12% in a day while Congress kills crypto legislation",
+            "What is the most amount of money you have made in memecoins?",
+            "My first 3 days trading memecoins on Pump.fun",
+            "Why shiba inu is failing traders ?",
+        ]
+        posts = [post(hours_ago=1.0, title=t, id=f"live{i}") for i, t in enumerate(titles)]
+        for coin in (WIF, BONK):
+            assert S.matching_posts(posts, coin.aliases) == []
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +420,150 @@ class TestSweepObservedThrough:
         through ``failures``. Calling it a 10h lag would be a second, wrong
         explanation for the same symptom."""
         assert S.sweep_observed_through(self.Lagging(), [], NOW) is None
+
+
+# ---------------------------------------------------------------------------
+# Empty sweeps — "missing is never zero", applied to the fields next door
+# ---------------------------------------------------------------------------
+
+
+class TestEmptySweep:
+    """A sweep that read nothing is a failed read, not a silent Reddit.
+
+    ``TestIndexLag`` above protects ``mention_velocity_1h`` from exactly this
+    mistake. The fields beside it were not protected: the 2026-09-18 cache
+    shipped ``mention_velocity_24h = 0.0`` and ``unique_contributors_24h = 0``
+    for all three coins, and had the sweep been empty rather than merely 10h
+    behind, those would have gone to the model with ``degraded_reason = None``
+    on them. "Zero unique contributors" reads as "nobody is talking about this
+    coin", which is the same manufactured bearish claim one field over.
+
+    The trigger is ordinary, not exotic. arctic-shift answers a subreddit with
+    nothing in the window with HTTP 200 and ``{"data": []}``, which never
+    reaches ``failures``: r/SatoshiStreetBets came back that way for two entire
+    days (2026-09-15 and -16) and for 24 of 28 consecutive hours scanned on
+    2026-09-19.
+    """
+
+    SWEPT = 143  # what the live 2026-09-19 sweep actually returned
+
+    def test_rates_are_none_not_zero(self, cfg):
+        b = S.build_brief(WIF, cfg, [], "arctic_shift", NOW, history=None, sweep_size=0)
+        assert b.mention_velocity_1h is None
+        assert b.mention_velocity_24h is None
+        assert b.mention_zscore_7d is None
+        assert b.contributor_to_post_ratio is None
+        assert b.polarity is None
+
+    def test_it_says_why(self, cfg):
+        b = S.build_brief(WIF, cfg, [], "arctic_shift", NOW, history=None, sweep_size=0)
+        assert b.degraded_reason and "no posts at all" in b.degraded_reason
+
+    def test_a_genuine_zero_survives(self, cfg):
+        """The other half of the distinction, and the one a fix can destroy by
+        overshooting. The sweep looked at 143 posts and none mentioned this
+        coin: that is a measurement, and blanking it would throw away the
+        "we looked and it is quiet" signal the module exists to preserve."""
+        b = S.build_brief(WIF, cfg, [], "arctic_shift", NOW, history=None, sweep_size=self.SWEPT)
+        assert b.mention_velocity_1h == 0.0
+        assert b.mention_velocity_24h == 0.0
+        assert b.unique_contributors_24h == 0
+
+    def test_a_genuine_zero_carries_its_denominator(self, cfg):
+        """0 out of 143 and 0 out of 3 are different claims, and the model
+        cannot weigh the first without the second number."""
+        b = S.build_brief(WIF, cfg, [], "arctic_shift", NOW, history=None, sweep_size=self.SWEPT)
+        assert "0 mentions of WIF" in (b.degraded_reason or "")
+        assert "143 posts" in (b.degraded_reason or "")
+
+    def test_a_nonzero_count_needs_no_denominator_note(self, cfg):
+        b = S.build_brief(
+            WIF, cfg, [post(hours_ago=0.5)], "arctic_shift", NOW,
+            history=None, sweep_size=self.SWEPT,
+        )
+        assert "0 mentions" not in (b.degraded_reason or "")
+
+    def test_omitting_sweep_size_still_means_observed(self, cfg):
+        """Every hand-built ``posts`` list and every ``fetch()``-only provider
+        depends on this: declining to report a sweep size must not blank the
+        arithmetic."""
+        b = S.build_brief(WIF, cfg, [], "arctic_shift", NOW, history=None)
+        assert b.mention_velocity_1h == 0.0
+        assert b.mention_velocity_24h == 0.0
+        assert "no posts at all" not in (b.degraded_reason or "")
+
+    def test_the_baseline_is_not_seeded_from_an_empty_sweep(self, cfg):
+        """Fabricated zeros here are permanent, unlike the index-lag case.
+        A lagging index is self-healing because the next sweep re-reads those
+        hours; an hour nothing was read from is never revisited, so a
+        manufactured zero sits in the 7-day baseline dragging the mean down and
+        inflating every later z-score for good."""
+        history: dict[str, int] = {}
+        S.build_brief(WIF, cfg, [], "arctic_shift", NOW, history=history, sweep_size=0)
+        assert history == {}
+
+    def test_an_observed_sweep_still_seeds_the_baseline(self, cfg):
+        """The contrast: observed quiet hours are observations and must land,
+        otherwise the baseline is built only out of busy hours."""
+        history: dict[str, int] = {}
+        S.build_brief(WIF, cfg, [], "arctic_shift", NOW, history=history, sweep_size=self.SWEPT)
+        assert len(history) == cfg.sentiment.lookback_hours + 1
+        assert set(history.values()) == {0}
+
+    def test_an_existing_baseline_is_left_intact(self, cfg):
+        """Not seeding must not mean discarding — ``brief()`` writes this dict
+        straight back to the cache file."""
+        history = {str(int(NOW // 3600) - 1 - i): 2 for i in range(60)}
+        before = dict(history)
+        S.build_brief(WIF, cfg, [], "arctic_shift", NOW, history=history, sweep_size=0)
+        assert history == before
+
+    def test_no_zscore_is_invented_from_an_unobserved_sweep(self, cfg):
+        history = {str(int(NOW // 3600) - 1 - i): (0 if i % 2 else 4) for i in range(60)}
+        b = S.build_brief(WIF, cfg, [], "arctic_shift", NOW, history=history, sweep_size=0)
+        assert b.mention_zscore_7d is None
+        assert "nothing was observed" in (b.degraded_reason or "")
+
+    def test_contributors_are_unmeasured_not_zero(self, cfg):
+        """Breadth is the last count that used to escape the rule. A ``0`` here
+        reads as "nobody is talking about this coin" — the bearish claim — so an
+        unobserved sweep reports no breadth rather than no people."""
+        b = S.build_brief(WIF, cfg, [], "arctic_shift", NOW, history=None, sweep_size=0)
+        assert b.unique_contributors_24h is None
+        assert "unmeasured, not zero" in (b.degraded_reason or "")
+
+    def test_an_observed_sweep_that_misses_this_coin_still_reports_zero(self, cfg):
+        """The other half of the distinction, and the reason ``sweep_size`` is
+        measured before the alias filter: 135 posts read and none of them
+        mentioning WIF is a real zero, and must not be softened into ``None``."""
+        b = S.build_brief(WIF, cfg, [], "arctic_shift", NOW, history=None, sweep_size=135)
+        assert b.unique_contributors_24h == 0
+        assert b.mention_velocity_24h == 0.0
+
+    def test_end_to_end_through_brief(self, cfg):
+        """Still a brief, not a ``None``: the outage is described rather than
+        hidden, which keeps the reason on its way to the prompt."""
+        b = S.brief(WIF, cfg, provider=StubPostSource(posts=[]), now=NOW)
+        assert b is not None
+        assert b.mention_velocity_1h is None
+        assert b.mention_velocity_24h is None
+
+    def test_the_cache_round_trip_keeps_the_nones(self, cfg):
+        """The TTL is 10 minutes, so a cached "not observed" is reused for the
+        rest of the window. Rehydrating it as a confident zero would put the
+        bug back one layer down."""
+        S.brief(WIF, cfg, provider=StubPostSource(posts=[]), now=NOW)
+        cached = S.brief(WIF, cfg, provider=StubPostSource(posts=[]), now=NOW + 60)
+        assert cached is not None
+        assert cached.mention_velocity_1h is None
+        assert cached.mention_velocity_24h is None
+
+    def test_an_empty_sweep_and_a_quiet_one_are_distinguishable(self, cfg):
+        """The whole point, stated in one assertion."""
+        unobserved = S.build_brief(WIF, cfg, [], "arctic_shift", NOW, history=None, sweep_size=0)
+        quiet = S.build_brief(WIF, cfg, [], "arctic_shift", NOW, history=None, sweep_size=self.SWEPT)
+        assert unobserved.mention_velocity_24h is None
+        assert quiet.mention_velocity_24h == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -717,11 +893,20 @@ class TestCache:
         assert len(hourly_1) == cfg.sentiment.lookback_hours + 1
 
         # A day later, with the cache expired, the old buckets are still there.
+        # The second sweep reads posts that say nothing about WIF rather than
+        # no posts at all: an empty sweep now means "we did not look", and a
+        # tick that did not look must not extend the baseline. Quiet hours that
+        # were genuinely observed still have to land, which is what this
+        # asserts.
         later = NOW + 24 * HOUR
-        S.brief(WIF, cfg, provider=StubPostSource(posts=[]), now=later)
+        quiet = StubPostSource(
+            posts=[S.Post("q1", later - 600, "u9", "BONK chatter only", "", 1, "solana")]
+        )
+        S.brief(WIF, cfg, provider=quiet, now=later)
         hourly_2 = S.load_cache(cfg)["symbols"]["WIF"]["hourly"]
         assert len(hourly_2) > len(hourly_1)
         assert set(hourly_1) < set(hourly_2)
+        assert sum(hourly_2.values()) == 1  # the one WIF post from the first run
 
 
 class TestCachePrivacy:
@@ -766,7 +951,11 @@ class TestCachePrivacy:
     def test_cache_holds_only_counts_and_timestamps(self, cfg):
         self._run(cfg)
         entry = S.load_cache(cfg)["symbols"]["WIF"]
-        assert set(entry) == {"brief", "fetched_at", "hourly"}
+        # ``unit`` names what the hourly buckets counted. It is a fixed label,
+        # not user content, and it is what lets an ``include_comments`` flip
+        # invalidate one symbol instead of the whole file.
+        assert set(entry) == {"brief", "fetched_at", "hourly", "unit"}
+        assert entry["unit"] in {"submissions", "submissions+comments"}
         assert all(isinstance(v, int) for v in entry["hourly"].values())
         assert all(k.isdigit() for k in entry["hourly"])
         assert "top_posts" not in entry["brief"]
@@ -796,8 +985,27 @@ class TestCachePrivacy:
 # ---------------------------------------------------------------------------
 
 
-def _arctic_client(handler) -> httpx.Client:
-    return httpx.Client(transport=httpx.MockTransport(handler), base_url="http://test")
+def _no_comments(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, json={"data": []})
+
+
+def _arctic_client(handler, comments=None) -> httpx.Client:
+    """Mock transport routing the two search endpoints separately.
+
+    They are genuinely different endpoints with different field whitelists, so
+    a single handler answering both would let a test pass that the live host
+    would 400. ``comments`` defaults to an empty page: a test about the
+    submission sweep says so by not modelling comments, rather than by
+    accidentally receiving submission rows on the comment endpoint and
+    double-counting every post.
+    """
+
+    def route(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/comments/search"):
+            return (comments or _no_comments)(request)
+        return handler(request)
+
+    return httpx.Client(transport=httpx.MockTransport(route), base_url="http://test")
 
 
 class TestArcticShiftProvider:
@@ -900,6 +1108,58 @@ class TestArcticShiftProvider:
         assert out["BONK"].mention_velocity_24h > 0
         assert calls["n"] == len(cfg.sentiment.subreddits)  # not x2 for two coins
 
+    def test_every_subreddit_answering_empty_is_not_a_failure(self, cfg):
+        """HTTP 200 with ``{"data": []}`` is the live shape for a subreddit
+        with nothing in the window, so it never raises and never lands in
+        ``failures``. That is correct on its own and was the trap: nothing
+        downstream could tell this apart from a healthy read of a silent
+        Reddit."""
+        provider = S.ArcticShiftProvider(
+            client=_arctic_client(lambda r: httpx.Response(200, json={"data": []}))
+        )
+        posts, failures = provider.posts(WIF, cfg, NOW)
+        assert posts == []
+        assert failures == []
+        assert S.sweep_observed_through(provider, posts, NOW) is None
+
+    def test_an_all_empty_sweep_reaches_the_model_as_unmeasured(self, cfg):
+        """The end of that trap. Before ``sweep_size``, this exact response
+        produced ``mention_velocity_1h = 0.0``, ``mention_velocity_24h = 0.0``,
+        ``unique_contributors_24h = 0`` and ``degraded_reason = None`` — the
+        most confident wrong number this module can emit, with no marker on
+        it at all."""
+        provider = S.ArcticShiftProvider(
+            client=_arctic_client(lambda r: httpx.Response(200, json={"data": []}))
+        )
+        b = S.brief(WIF, cfg, provider=provider, now=NOW)
+        assert b is not None
+        assert b.mention_velocity_1h is None
+        assert b.mention_velocity_24h is None
+        assert b.mention_zscore_7d is None
+        assert "no posts at all" in (b.degraded_reason or "")
+        # And nothing fabricated was persisted for the baseline to inherit.
+        assert S.load_cache(cfg)["symbols"]["WIF"]["hourly"] == {}
+
+    def test_a_sweep_with_no_mention_of_this_coin_is_a_real_zero(self, cfg):
+        """What the live sweep actually looks like. On 2026-09-19 it returned
+        143 posts across the five subreddits and not one mentioned BONK, WIF
+        or POPCAT — which is the expected outcome at these base rates (23 BONK
+        submissions in the preceding 90 days), not a defect. It must come
+        through as 0.0 with the denominator attached, never as ``None``."""
+        rows = [
+            _raw(id="n1", title="Robux has to move right??!"),
+            _raw(id="n2", title="What is the most amount of money you have made in memecoins?"),
+        ]
+        provider = S.ArcticShiftProvider(
+            client=_arctic_client(lambda r: httpx.Response(200, json={"data": rows}))
+        )
+        b = S.brief(WIF, cfg, provider=provider, now=NOW)
+        assert b is not None
+        assert b.mention_velocity_24h == 0.0
+        assert b.unique_contributors_24h == 0
+        assert "0 mentions of WIF" in (b.degraded_reason or "")
+        assert "2 posts" in (b.degraded_reason or "")
+
     def test_base_url_is_the_verified_one(self):
         assert S.ARCTIC_SHIFT_BASE == "https://arctic-shift.photon-reddit.com/api"
 
@@ -938,11 +1198,33 @@ class FakeSubmission:
         self.subreddit = subreddit
 
 
+class FakeComment:
+    """A PRAW ``Comment``: a body, no title. The shape difference is the point."""
+
+    def __init__(self, id, body, author, created_utc, score=1, subreddit="solana"):
+        self.id = id
+        self.body = body
+        self.author = FakeAuthor(author) if author else None
+        self.created_utc = created_utc
+        self.score = score
+        self.subreddit = subreddit
+
+
 class FakeSubreddit:
-    def __init__(self, display_name, results, recorder):
+    def __init__(self, display_name, results, recorder, comments=()):
         self.display_name = display_name
         self._results = results
         self._recorder = recorder
+        self._comments = list(comments)
+
+    def comments(self, **kwargs):
+        # In praw 8.0.3 ``Subreddit.comments`` is a cachedproperty yielding a
+        # callable CommentHelper, so ``subreddit.comments(limit=N)`` is the real
+        # call shape; a plain method reproduces it from the caller's side.
+        self._recorder.append({"subreddit": self.display_name, "listing": "comments", **kwargs})
+        ordered = sorted(self._comments, key=lambda c: c.created_utc, reverse=True)
+        limit = kwargs.get("limit")
+        return iter(ordered if limit is None else ordered[:limit])
 
     def new(self, **kwargs):
         # ``new`` takes only listing kwargs in PRAW 8. Results are handed back
@@ -961,15 +1243,16 @@ class FakeSubreddit:
 
 
 class FakeReddit:
-    def __init__(self, results):
+    def __init__(self, results, comments=()):
         self._results = results
+        self._comments = list(comments)
         self.listings: list[dict] = []
         self.requested: list[str] = []
         self.read_only = False
 
     def subreddit(self, display_name):
         self.requested.append(display_name)
-        return FakeSubreddit(display_name, self._results, self.listings)
+        return FakeSubreddit(display_name, self._results, self.listings, self._comments)
 
 
 class UnsortedReddit(FakeReddit):
@@ -1013,8 +1296,21 @@ class TestPrawProvider:
         # One listing per subreddit — and emphatically not a `a+b` multireddit
         # search, which would put Reddit's lagging search index in the path.
         assert reddit.requested == ["CryptoCurrency", "solana"]
-        assert [c["subreddit"] for c in reddit.listings] == ["CryptoCurrency", "solana"]
-        assert all(c["limit"] == S._PRAW_NEW_LIMIT for c in reddit.listings)
+        # Two listings per subreddit now — ``/new`` and ``/comments`` — and
+        # still emphatically not a `a+b` multireddit search, which would put
+        # Reddit's lagging search index in the path.
+        assert [c["subreddit"] for c in reddit.listings] == [
+            "CryptoCurrency",
+            "CryptoCurrency",
+            "solana",
+            "solana",
+        ]
+        new = [c for c in reddit.listings if "listing" not in c]
+        comments = [c for c in reddit.listings if c.get("listing") == "comments"]
+        assert [c["subreddit"] for c in new] == ["CryptoCurrency", "solana"]
+        assert all(c["limit"] == S._PRAW_NEW_LIMIT for c in new)
+        assert [c["subreddit"] for c in comments] == ["CryptoCurrency", "solana"]
+        assert all(c["limit"] == S._PRAW_COMMENT_LIMIT for c in comments)
 
     def test_the_sweep_is_shared_across_coins(self, cfg):
         now = time.time()
@@ -1107,6 +1403,18 @@ class TestPrawProvider:
             S.PrawProvider(reddit=FakeReddit([])).posts(WIF, cfg, time.time())
         assert S.brief(WIF, cfg, provider=S.PrawProvider(reddit=FakeReddit([])), now=NOW) is None
 
+    def test_an_empty_new_sweep_is_not_reported_as_silence(self, cfg):
+        """PRAW sweeps whole subreddits too, so an empty sweep here means the
+        same thing it means on the archive path: we read nothing. The lag
+        machinery cannot catch it — ``index_lags`` is ``False`` for a live
+        listing, so ``observed_through`` stays ``None`` and every rate would
+        otherwise come out a confident zero."""
+        b = S.brief(WIF, cfg, provider=S.PrawProvider(reddit=FakeReddit([])), now=NOW)
+        assert b is not None
+        assert b.mention_velocity_1h is None
+        assert b.mention_velocity_24h is None
+        assert "no posts at all" in (b.degraded_reason or "")
+
     def test_a_praw_explosion_never_escapes_brief(self, cfg):
         class Exploding(FakeReddit):
             def subreddit(self, display_name):
@@ -1127,3 +1435,392 @@ class TestProviderSelection:
     def test_partial_credentials_fall_back(self, tmp_path):
         cfg = make_config(tmp_path, reddit_client_id="abc", reddit_client_secret=None)
         assert isinstance(S.default_provider(cfg), S.ArcticShiftProvider)
+
+
+# ---------------------------------------------------------------------------
+# Comments — the second half of the sweep
+# ---------------------------------------------------------------------------
+
+
+def _raw_comment(
+    *, id: str, created: float | None = None, body: str = "WIF is up", author: str = "u1"
+) -> dict:
+    """One row as ``/api/comments/search`` actually returns it.
+
+    Note what is *absent*: no ``title``, no ``selftext``, no ``num_comments``.
+    Those three are valid on ``/posts/search`` and 400 on this endpoint, which
+    is why the two normalizers cannot be one function.
+    """
+    return {
+        "id": id,
+        "created_utc": created if created is not None else NOW - 600,
+        "author": author,
+        "body": body,
+        "score": 3,
+        "subreddit": "solana",
+        "link_id": "t3_abc",
+    }
+
+
+class TestCommentNormalization:
+    def test_a_comment_becomes_a_post_with_no_title(self):
+        c = S._comment_from_arctic(_raw_comment(id="c1", body="bought more $WIF"))
+        assert c is not None
+        assert c.kind == "comment"
+        assert c.title == ""
+        assert c.body == "bought more $WIF"
+        # ``text`` is what ``matching_posts`` reads, so an empty title must not
+        # cost the body its match.
+        assert "bought more $WIF" in c.text
+
+    def test_a_submission_still_defaults_to_submission_kind(self):
+        p = S._post_from_arctic(_raw(id="s1"))
+        assert p is not None and p.kind == "submission"
+
+    def test_post_kind_is_trailing_and_defaulted(self):
+        """Positional construction is used throughout this file and elsewhere."""
+        p = S.Post("q1", NOW - 600, "u9", "BONK chatter only", "", 1, "solana")
+        assert p.kind == "submission"
+
+    def test_unusable_comment_rows_are_dropped_not_faked(self):
+        assert S._comment_from_arctic({"id": "c1"}) is None  # no created_utc
+        assert S._comment_from_arctic({"id": "c1", "created_utc": "nope"}) is None
+
+    def test_a_comment_is_matched_on_its_body_alone(self):
+        c = S._comment_from_arctic(_raw_comment(id="c1", body="my wife says no"))
+        assert c is not None
+        # The word-boundary rule is shared, so "wife" is still not a WIF mention.
+        assert S.matching_posts([c], WIF.aliases) == []
+
+    def test_praw_comment_normalizes_the_same_way(self):
+        c = S._comment_from_praw(
+            FakeComment("c1", "WIF to the moon", "alice", NOW - 600, score=7)
+        )
+        assert c is not None
+        assert (c.kind, c.title, c.body, c.score) == ("comment", "", "WIF to the moon", 7)
+
+
+class TestCommentSweep:
+    @pytest.fixture(autouse=True)
+    def _no_sleeping(self, monkeypatch):
+        monkeypatch.setattr(S, "_ARCTIC_SPACING_S", 0.0)
+
+    def test_arctic_uses_the_comment_field_whitelist(self, cfg):
+        """A shared ``fields`` constant would 400 every comment request."""
+        seen: list[httpx.Request] = []
+
+        def comments(request):
+            seen.append(request)
+            return httpx.Response(200, json={"data": []})
+
+        provider = S.ArcticShiftProvider(
+            client=_arctic_client(lambda r: httpx.Response(200, json={"data": []}), comments)
+        )
+        provider.posts(WIF, cfg, NOW)
+
+        assert seen, "the comments endpoint was never called"
+        fields = seen[0].url.params["fields"].split(",")
+        assert "body" in fields
+        # The three that are valid for posts and rejected for comments.
+        assert not {"title", "selftext", "num_comments"} & set(fields)
+
+    def test_comments_and_submissions_merge_into_one_sweep(self, cfg):
+        provider = S.ArcticShiftProvider(
+            client=_arctic_client(
+                lambda r: httpx.Response(200, json={"data": [_raw(id="s1", title="WIF up")]}),
+                lambda r: httpx.Response(
+                    200, json={"data": [_raw_comment(id="c1", body="WIF up too")]}
+                ),
+            )
+        )
+        posts, failures = provider.posts(WIF, cfg, NOW)
+        assert failures == []
+        assert sorted(p.kind for p in posts) == ["comment", "submission"]
+
+    def test_a_shared_id_across_kinds_does_not_collide(self, cfg):
+        """Submission and comment ids come from different Reddit namespaces.
+
+        Keying the sweep by bare id would silently drop one of the two and
+        understate both the mention count and ``sweep_size``.
+        """
+        provider = S.ArcticShiftProvider(
+            client=_arctic_client(
+                lambda r: httpx.Response(200, json={"data": [_raw(id="dup", title="WIF up")]}),
+                lambda r: httpx.Response(
+                    200, json={"data": [_raw_comment(id="dup", body="WIF up")]}
+                ),
+            )
+        )
+        posts, _ = provider.posts(WIF, cfg, NOW)
+        assert len(posts) == 2
+
+    def test_sweep_size_counts_both_kinds(self, cfg):
+        """The denominator behind a reported zero must include comments."""
+        provider = S.ArcticShiftProvider(
+            client=_arctic_client(
+                lambda r: httpx.Response(200, json={"data": [_raw(id="s1", title="doge news")]}),
+                lambda r: httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            _raw_comment(id="c1", body="nothing here"),
+                            _raw_comment(id="c2", body="nor here"),
+                        ]
+                    },
+                ),
+            )
+        )
+        b = S.brief(WIF, cfg, provider=provider, now=NOW)
+        assert b is not None
+        assert "the sweep observed 3 posts and comments" in (b.degraded_reason or "")
+
+    def test_comments_off_behaves_exactly_as_before(self, tmp_path):
+        cfg = make_config(tmp_path, include_comments=False)
+        called: list[str] = []
+
+        def comments(request):  # pragma: no cover - must never be reached
+            called.append(str(request.url))
+            return httpx.Response(200, json={"data": []})
+
+        provider = S.ArcticShiftProvider(
+            client=_arctic_client(
+                lambda r: httpx.Response(200, json={"data": [_raw(id="s1", title="WIF up")]}),
+                comments,
+            )
+        )
+        posts, _ = provider.posts(WIF, cfg, NOW)
+        assert called == []
+        assert posts and all(p.kind == "submission" for p in posts)
+
+    def test_comments_off_says_posts_not_posts_and_comments(self, tmp_path):
+        cfg = make_config(tmp_path, include_comments=False)
+        provider = S.ArcticShiftProvider(
+            client=_arctic_client(
+                lambda r: httpx.Response(200, json={"data": [_raw(id="s1", title="doge news")]})
+            )
+        )
+        b = S.brief(WIF, cfg, provider=provider, now=NOW)
+        assert b is not None
+        assert "the sweep observed 1 posts over" in (b.degraded_reason or "")
+
+    def test_praw_sweeps_comments_alongside_new(self, cfg):
+        reddit = FakeReddit(
+            [FakeSubmission("s1", "doge news", "alice", NOW - 600)],
+            [FakeComment("c1", "WIF looks strong", "bob", NOW - 300, score=5)],
+        )
+        posts, failures = S.PrawProvider(reddit=reddit).posts(WIF, cfg, NOW)
+        assert failures == []
+        matched = S.matching_posts(posts, WIF.aliases)
+        assert matched and all(p.kind == "comment" for p in matched)
+
+    def test_praw_comments_off_skips_the_listing(self, tmp_path):
+        cfg = make_config(tmp_path, include_comments=False)
+        reddit = FakeReddit(
+            [FakeSubmission("s1", "WIF up", "alice", NOW - 600)],
+            [FakeComment("c1", "WIF looks strong", "bob", NOW - 300)],
+        )
+        posts, _ = S.PrawProvider(reddit=reddit).posts(WIF, cfg, NOW)
+        assert all(c.get("listing") != "comments" for c in reddit.listings)
+        assert posts and all(p.kind == "submission" for p in posts)
+
+    def test_praw_comments_outside_the_window_are_dropped(self, cfg):
+        reddit = FakeReddit(
+            [],
+            [
+                FakeComment("c1", "WIF now", "bob", NOW - 300),
+                FakeComment("c2", "WIF ages ago", "bob", NOW - 40 * HOUR),
+                FakeComment("c3", "WIF older still", "bob", NOW - 41 * HOUR),
+                FakeComment("c4", "WIF oldest", "bob", NOW - 42 * HOUR),
+            ],
+        )
+        posts, _ = S.PrawProvider(reddit=reddit).posts(WIF, cfg, NOW)
+        assert {p.id for p in posts} == {"c1"}
+
+
+class TestPartialCommentCoverage:
+    """The 422 is a per-range server-side timeout, not rate limiting.
+
+    No page budget completes a 24h comment walk of a busy subreddit, so the
+    only honest response is to keep what was read and say how much of the
+    window it covered. A silently short window would read as a quiet subreddit.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_sleeping(self, monkeypatch):
+        monkeypatch.setattr(S, "_ARCTIC_SPACING_S", 0.0)
+
+    def _provider(self, pages_before_422: int):
+        state = {"n": 0}
+
+        def comments(request):
+            state["n"] += 1
+            if state["n"] > pages_before_422:
+                return httpx.Response(
+                    422, json={"data": None, "error": "Timeout. Maybe slow down a bit"}
+                )
+            # A full page, so the walk tries to page backwards again.
+            page = state["n"]
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        _raw_comment(id=f"c{page}-{i}", created=NOW - 60 - i * 60)
+                        for i in range(S._ARCTIC_MAX_LIMIT)
+                    ]
+                },
+            )
+
+        return S.ArcticShiftProvider(
+            client=_arctic_client(
+                lambda r: httpx.Response(200, json={"data": [_raw(id="s1", title="WIF up")]}),
+                comments,
+            )
+        )
+
+    def test_a_walk_that_stops_short_keeps_what_it_read(self, cfg):
+        provider = self._provider(pages_before_422=2)
+        posts, failures = provider.posts(WIF, cfg, NOW)
+        # Not a failure: the submissions came back and so did two comment pages.
+        assert failures == []
+        assert sum(1 for p in posts if p.kind == "comment") > 0
+
+    def test_partial_coverage_is_reported_not_hidden(self, cfg):
+        provider = self._provider(pages_before_422=2)
+        provider.posts(WIF, cfg, NOW)
+        note = " ".join(provider.sweep_notes)
+        assert "comment sweep covered less than the requested 24h window" in note
+        assert "floor" in note
+
+    def test_the_note_reaches_the_brief(self, cfg):
+        b = S.brief(WIF, cfg, provider=self._provider(pages_before_422=2), now=NOW)
+        assert b is not None
+        assert "comment sweep covered less than" in (b.degraded_reason or "")
+
+    def test_a_first_page_failure_is_a_gap_not_a_dead_subreddit(self, cfg):
+        """Submissions already landed, so the subreddit is not in ``failures``."""
+        provider = S.ArcticShiftProvider(
+            client=_arctic_client(
+                lambda r: httpx.Response(200, json={"data": [_raw(id="s1", title="WIF up")]}),
+                lambda r: httpx.Response(422, json={"data": None, "error": "Timeout."}),
+            )
+        )
+        posts, failures = provider.posts(WIF, cfg, NOW)
+        assert failures == []
+        assert posts and all(p.kind == "submission" for p in posts)
+        assert "comment sweep covered less than" in " ".join(provider.sweep_notes)
+
+    def test_a_complete_walk_says_nothing(self, cfg):
+        provider = S.ArcticShiftProvider(
+            client=_arctic_client(
+                lambda r: httpx.Response(200, json={"data": [_raw(id="s1", title="WIF up")]}),
+                lambda r: httpx.Response(200, json={"data": [_raw_comment(id="c1")]}),
+            )
+        )
+        provider.posts(WIF, cfg, NOW)
+        assert provider.sweep_notes == []
+
+    def test_praw_reports_hitting_the_pagination_ceiling(self, cfg, monkeypatch):
+        monkeypatch.setattr(S, "_PRAW_COMMENT_LIMIT", 3)
+        reddit = FakeReddit(
+            [],
+            [FakeComment(f"c{i}", "WIF", "bob", NOW - 60 - i) for i in range(10)],
+        )
+        provider = S.PrawProvider(reddit=reddit)
+        provider.posts(WIF, cfg, NOW)
+        note = " ".join(provider.sweep_notes)
+        assert "pagination limit" in note and "floor" in note
+
+
+class TestBaselineUnit:
+    """A bucket counted over submissions+comments is not comparable to one
+    counted over submissions alone, and mixing them would read as a burst of
+    attention on every coin at once."""
+
+    def _run(self, cfg, now):
+        provider = StubPostSource([post(hours_ago=0.2, title="WIF is pumping", author="alice")])
+        return S.brief(WIF, cfg, provider=provider, now=now)
+
+    def test_the_unit_is_recorded_on_the_entry(self, cfg):
+        self._run(cfg, NOW)
+        assert S.load_cache(cfg)["symbols"]["WIF"]["unit"] == "submissions+comments"
+
+    def test_turning_comments_off_records_the_other_unit(self, tmp_path):
+        cfg = make_config(tmp_path, include_comments=False)
+        self._run(cfg, NOW)
+        assert S.load_cache(cfg)["symbols"]["WIF"]["unit"] == "submissions"
+
+    def test_flipping_the_toggle_discards_that_symbols_history(self, tmp_path):
+        on = make_config(tmp_path, include_comments=True, cache_ttl_seconds=0)
+        self._run(on, NOW)
+        assert S.load_cache(on)["symbols"]["WIF"]["hourly"]
+
+        off = make_config(tmp_path, include_comments=False, cache_ttl_seconds=0)
+        b = self._run(off, NOW + 3600)
+        assert b is not None
+        assert "baseline discarded" in (b.degraded_reason or "")
+        entry = S.load_cache(off)["symbols"]["WIF"]
+        assert entry["unit"] == "submissions"
+        # Rebuilt from this tick's window only — the old buckets are gone, not
+        # merged into a baseline that would now be measuring two things.
+        assert len(entry["hourly"]) <= off.sentiment.lookback_hours + 2
+
+    def test_an_unchanged_unit_keeps_the_history(self, tmp_path):
+        cfg = make_config(tmp_path, include_comments=True, cache_ttl_seconds=0)
+        self._run(cfg, NOW)
+        before = dict(S.load_cache(cfg)["symbols"]["WIF"]["hourly"])
+        b = self._run(cfg, NOW + 3600)
+        assert b is not None
+        assert "baseline discarded" not in (b.degraded_reason or "")
+        after = S.load_cache(cfg)["symbols"]["WIF"]["hourly"]
+        assert set(before) & set(after)
+
+    def test_the_version_bump_discards_a_v1_file(self, cfg):
+        """Version 1 buckets counted submissions only and cannot be rescued."""
+        S.cache_path(cfg).write_text(
+            json.dumps({"version": 1, "symbols": {"WIF": {"hourly": {"1": 9}}}}),
+            encoding="utf-8",
+        )
+        assert S.CACHE_VERSION == 2
+        assert S.load_cache(cfg) == {"version": 2, "symbols": {}}
+
+
+class TestCommentPrivacy:
+    """A comment body is user content on the same terms as a submission."""
+
+    SECRET = "zzsecretcommentbodyzz"
+
+    def test_no_comment_body_or_author_reaches_disk(self, cfg):
+        provider = StubPostSource(
+            [
+                S.Post(
+                    "c1",
+                    NOW - 600,
+                    "zzsecretcommenterzz",
+                    "",
+                    f"WIF {self.SECRET}",
+                    4,
+                    "solana",
+                    "comment",
+                )
+            ]
+        )
+        b = S.brief(WIF, cfg, provider=provider, now=NOW)
+        assert b is not None and b.unique_contributors_24h == 1
+        # It did reach the *prompt* — that is the point of top_posts.
+        assert self.SECRET in b.top_posts[0].title
+
+        raw = S.cache_path(cfg).read_text(encoding="utf-8")
+        assert self.SECRET not in raw
+        assert "zzsecretcommenterzz" not in raw.lower()
+        assert "body" not in raw
+
+    def test_a_comment_top_post_carries_its_kind_and_its_text(self, cfg):
+        """``report.py`` rendered ``p.title`` and printed nothing for a comment."""
+        provider = StubPostSource(
+            [S.Post("c1", NOW - 600, "bob", "", "WIF looks strong", 4, "solana", "comment")]
+        )
+        b = S.brief(WIF, cfg, provider=provider, now=NOW)
+        assert b is not None
+        top = b.top_posts[0]
+        assert top.kind == "comment"
+        assert top.title == "WIF looks strong"

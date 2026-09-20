@@ -345,6 +345,24 @@ def _age(seconds: float | None) -> str:
     return f"{seconds / 86400:.1f}d"
 
 
+def _liquidity_trend(pct: float | None, seconds: float | None) -> str:
+    """The liquidity trend and the window it was actually measured over.
+
+    The window is printed because the percentage is unreadable without one: -6%
+    is a wobble over a day and an exit over a quarter of an hour. This line used
+    to read "trend vs last tick", which a model takes for the decision cadence
+    it was told it wakes up on, while the number behind it was a 60-second delta
+    — so a pool shedding 10% of its depth between decisions rendered as -0.7%.
+
+    With no earlier decision there is no trend, and the absence says so out loud:
+    a 0.0% here would claim a perfectly stable pool, which is the opposite of
+    "we have not looked twice yet".
+    """
+    if pct is None:
+        return f"trend {NA} (no earlier decision to compare against — NOT a stable pool)"
+    return f"trend over {_age(seconds)} {_pct(pct)}"
+
+
 def _clock(ts: float | None) -> str:
     if ts is None:
         return NA
@@ -388,9 +406,14 @@ def _sentiment_lines(s: SentimentBrief, now: float) -> list[str]:
             if s.mention_velocity_1h is None or s.mention_velocity_24h is None
             else ""
         ),
-        f"    breadth    {s.unique_contributors_24h} unique contributors in 24h; "
-        f"contributor/post ratio {_f(s.contributor_to_post_ratio, '.2f')}"
-        f"  <- low means few accounts posting a lot; treat as a warning",
+        f"    breadth    {_f(s.unique_contributors_24h, 'd')} unique contributors "
+        f"in 24h; contributor/post ratio {_f(s.contributor_to_post_ratio, '.2f')}"
+        f"  <- low means few accounts posting a lot; treat as a warning"
+        + (
+            "  <- n/a = the sweep read nothing, NOT that nobody posted"
+            if s.unique_contributors_24h is None
+            else ""
+        ),
         f"    polarity   {_f(s.polarity, '+.2f')}  [LOW TRUST — manufactured; "
         f"weigh attention, not mood]",
     ]
@@ -398,8 +421,15 @@ def _sentiment_lines(s: SentimentBrief, now: float) -> list[str]:
         lines.append("    top posts:")
         for p in s.top_posts[:5]:
             title = p.title if len(p.title) <= 110 else p.title[:107] + "..."
+            # Say which it is. A comment's text is an excerpt of its body, not a
+            # title, and the model reads these to judge whether a "mention" is
+            # real — a top-level submission titled about the coin and a passing
+            # aside inside a thread about something else are different evidence,
+            # and unlabelled they look identical here.
+            label = "comment" if p.kind == "comment" else "post"
             lines.append(
-                f"      [{p.score:>5}] r/{p.subreddit} {p.age_hours:.1f}h — {title}"
+                f"      [{p.score:>5}] r/{p.subreddit} {p.age_hours:.1f}h "
+                f"({label}) — {title}"
             )
     return lines
 
@@ -415,12 +445,13 @@ def _coin_section(bundle: EvidenceBundle, now: float) -> list[str]:
         )
 
     liq_trend = tech.flow.liquidity_trend_pct if tech is not None else None
+    liq_window = tech.flow.liquidity_trend_seconds if tech is not None else None
     lines += [
         "  PRICE/FLOW (DexScreener, on-chain) — highest-trust stream",
         f"    price      {_price(snap.price_usd)}   fdv {_usd(snap.fdv_usd, ',.0f')}"
         f"   dex {snap.dex_id}",
         f"    liquidity  {_usd(snap.liquidity_usd, ',.0f')}  "
-        f"trend vs last tick {_pct(liq_trend)}"
+        f"{_liquidity_trend(liq_trend, liq_window)}"
         f"   <- a draining pool outranks everything else here",
         f"    change     m5 {_pct(snap.price_change.m5)}  "
         f"h1 {_pct(snap.price_change.h1)}  "

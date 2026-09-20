@@ -23,6 +23,8 @@ memetrader = "memetrader.cli:app"
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
+    "ruff>=0.16",
+    "mypy>=2.3",
 ]
 
 [build-system]
@@ -31,3 +33,126 @@ build-backend = "uv_build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+# Measured rather than guessed. Across src/ the hand-wrapped lines pile up at 90
+# and 91 characters and then fall off a cliff at 92 — that bump is the author's
+# ruler, so 92 is the width this code was actually written to. Every module that
+# holds logic (risk, broker, config, signals, portfolio, quotes, journal) is
+# already under it with room to spare.
+line-length = 92
+target-version = "py314"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "F",      # pyflakes — unused imports and names, undefined references
+    "E", "W", # pycodestyle
+    "I",      # import order
+    "UP",     # pyupgrade — keeps `X | None` and modern stdlib imports honest
+    "FA",     # every module must keep its `from __future__ import annotations`
+    "B",      # bugbear — the real-bug subset
+    "BLE",    # blind `except Exception`; see per-file-ignores below
+    "C4",     # comprehensions
+    "SIM",    # simplifications that do not cost clarity
+    "RET",    # return-path tidiness
+    "PIE",
+    "PERF",
+    "PTH",    # this codebase is pathlib everywhere; keep it that way
+    "LOG", "G", # lazy %-formatting in log calls, not eager f-strings
+    "DTZ",    # naive datetimes — every timestamp here is epoch float, on purpose
+    "TID",    # no relative imports beyond the package
+    "T10",    # no stray breakpoints
+    "N",      # naming — kept because the tree already carries a `# noqa: N801`
+    "RSE", "ICN", "Q", "YTT", "FLY",
+    "RUF",
+]
+ignore = [
+    # The exceptions here are named for the condition they describe —
+    # `InsufficientCash`, `NoPosition`, `SourceUnavailable` — and read better at
+    # the raise site than an `-Error` suffix would.
+    "N818",
+    # `import sentiment as S` in test_sentiment.py, deliberate and local.
+    "N812",
+]
+# Deliberately absent, each for a reason found in the code itself:
+#   PL   — PLR0124 flags journal.py's `obj != obj`, which *is* the NaN test, and
+#          PLW2901 flags its `line = line.strip()`. Both are correct as written.
+#   TRY, EM — insist exception messages be short and hoisted to a variable. This
+#          project's messages are long prose on purpose ("BUY $400 rejected:
+#          would put BONK at 41% of book, limit is 30%") and that is the point.
+#   S    — 786 hits, almost all `assert` in tests, plus a false positive on the
+#          broker's non-cryptographic RNG, which is simulating a failed swap.
+#   ANN, D — annotations and docstrings are already better here than any rule
+#          would enforce; the misses are in test helpers where they do not help.
+#   COM, ISC — fight the formatter.
+#   ARG, FBT, PT, SLF, ERA, TC — noise against deliberate choices: protocol
+#          stubs with unused args, `dry_run=True`, tests reaching into privates,
+#          and prose comments read as dead code.
+
+[tool.ruff.lint.pycodestyle]
+# E501 trips at 100, not at `line-length`. 92 is the width to write to; the
+# handful of lines past it are Rich render strings in report.py and 44-character
+# base58 mints in test fixtures, neither of which wraps into anything more
+# readable. 100 is where a line is genuinely out of hand.
+max-line-length = 100
+
+[tool.ruff.lint.isort]
+known-first-party = ["memetrader"]
+
+[tool.ruff.lint.per-file-ignores]
+# Catching bare `Exception` is a bug almost everywhere, so BLE001 is on for the
+# whole tree — but these three modules are the documented exception and each
+# says so at length in its own docstring. sentiment.py promises never to raise
+# because losing one evidence stream must not fail a trading tick; loop.py
+# isolates a tick from a vendor outage, since an API failure is not a decision
+# to hold; cli.py turns any failure into a line a user can read. quotes.py makes
+# the same promise and already carries an inline `# noqa: BLE001` at its single
+# catch site, so it is deliberately left to that rather than exempted here.
+"src/memetrader/cli.py" = ["BLE001"]
+"src/memetrader/loop.py" = ["BLE001"]
+"src/memetrader/sentiment.py" = ["BLE001"]
+
+[tool.mypy]
+python_version = "3.14"
+files = ["src", "tests"]
+mypy_path = "src"
+explicit_package_bases = true   # tests/ is a plain directory, not a package
+namespace_packages = true
+
+# The package ships py.typed, so src/ is held to full annotations. Everything
+# below that is about catching wrong types rather than missing ones.
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unused_configs = true
+warn_no_return = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+# Test helpers build fakes and fixtures where a return annotation on every
+# closure earns nothing. The bodies are still checked.
+#
+# `operator` and `union-attr` are off here for one specific reason: half the
+# fields in Technicals, SentimentBrief and FillQuote are `X | None` by design,
+# because "not enough history to compute this" and "this is zero" are different
+# claims. A test that has just built 40 candles knows rsi14 is not None, and
+# `assert rising.ema9 > rising.ema21` is how that reads. Requiring an
+# `assert x is not None` in front of every such line would double the length of
+# the assertions and catch nothing. The codes that actually matter for tests —
+# call-arg, arg-type, attr-defined, call-overload — stay on, and they are what
+# catches a test drifting out of sync with the API it exercises.
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disable_error_code = ["operator", "union-attr"]
+
+[[tool.mypy.overrides]]
+# Neither ships type information. pandas is used only inside signals.py, whose
+# own signatures are fully annotated at the boundary, so the untyped interior is
+# contained rather than leaking into the rest of the package.
+module = ["praw.*", "prawcore.*", "pandas.*"]
+ignore_missing_imports = true

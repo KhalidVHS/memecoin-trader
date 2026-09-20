@@ -319,10 +319,255 @@ def test_a_logged_decision_rehydrates_into_a_renderable_record(
     assert "BUY BONK" in text
 
 
-def brain_usage():
+def test_the_models_thinking_reaches_the_decision_log_and_reads_back(
+    tmp_path: Path, stub_network: MarketSnapshot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Thinking tokens are the majority of what this project spends, and the
+    field sat unpopulated — so the reasoning behind every trade was paid for and
+    then discarded, leaving the log unable to answer why a loss looked like a good
+    idea at the time."""
+    from memetrader.types import Action, TradeDecision
+
+    cfg = make_cfg(tmp_path)
+    thinking = "liquidity -12% over the interval; exiting rather than sizing down"
+    decision = TradeDecision(
+        market_read="fabricated",
+        actions=[
+            Action(action="HOLD", symbol="BONK", size_usd=0.0,
+                   confidence=0.2, reasoning="waiting"),
+        ],
+    )
+    monkeypatch.setattr(
+        loop.brain, "decide", lambda *a, **kw: (decision, brain_usage(thinking=thinking))
+    )
+
+    trader = Trader(cfg, client=object())  # type: ignore[arg-type]
+    trader.slow_tick()
+
+    assert [r["thinking"] for r in decisions(cfg)] == [thinking]
+    assert trader.recent_decisions()[0].thinking == thinking
+
+    # A call that returned no thinking block at all — the API can redact it —
+    # records the absence rather than an empty string.
+    monkeypatch.setattr(loop.brain, "decide", lambda *a, **kw: (decision, brain_usage()))
+    trader.slow_tick()
+    assert decisions(cfg)[1]["thinking"] is None
+    assert trader.recent_decisions()[1].thinking is None
+
+    # Rows written before the field was populated have no key at all, and a
+    # missing thinking block is not an empty one.
+    older = {k: v for k, v in decisions(cfg)[0].items() if k != "thinking"}
+    assert loop._record_from_row(older).thinking is None
+
+
+# ---------------------------------------------------------------------------
+# The risk feedback channel survives a restart
+# ---------------------------------------------------------------------------
+
+
+def test_last_ticks_rejections_survive_a_restart(
+    tmp_path: Path, stub_network: MarketSnapshot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``pending_rejections`` was in-memory only, so a restart dropped the risk
+    feedback on the one tick most likely to repeat itself: nothing in the model's
+    context says it already proposed this and was refused. Every verdict is
+    already in decisions.jsonl, so a fresh Trader over the same data dir has to
+    come up knowing them."""
+    from memetrader import portfolio, prompts
+    from memetrader.types import Action, TradeDecision
+
+    cfg = make_cfg(tmp_path)
+    # $4 is under the $10 floor, which risk.py rejects outright. A size over the
+    # position cap would be *clamped* instead, and a clamp is still an approval.
+    decision = TradeDecision(
+        market_read="fabricated",
+        actions=[
+            Action(action="BUY", symbol="BONK", size_usd=4.0,
+                   confidence=0.7, reasoning="because"),
+        ],
+    )
+    monkeypatch.setattr(loop.brain, "decide", lambda *a, **kw: (decision, brain_usage()))
+
+    trader = Trader(cfg, client=object())  # type: ignore[arg-type]
+    assert trader.pending_rejections == [], "an empty log has nothing to replay"
+    trader.slow_tick()
+    assert [v.rule for v in trader.pending_rejections] == ["min_trade_size"]
+
+    # The restart: a second Trader over the same data dir, sharing no memory.
+    restarted = Trader(cfg, client=object())  # type: ignore[arg-type]
+    assert restarted.pending_rejections == trader.pending_rejections
+    assert all(not v.approved for v in restarted.pending_rejections), (
+        "approvals are not feedback — only what was refused goes back to the model"
+    )
+
+    # And it has to reach the prompt, not just the attribute.
+    book = portfolio.mark(restarted.broker, {"BONK": PRICE}, now=time.time())
+    text = prompts.render_user(
+        cfg,
+        restarted.evidence(restarted.snapshot()),
+        book,
+        restarted.recent_decisions(),
+        restarted.pending_rejections,
+    )
+    section = text.split("=== RISK VERDICTS FROM LAST TICK ===", 1)[1]
+    assert "min_trade_size" in section
+    assert "Do not re-propose them" in section
+
+
+# ---------------------------------------------------------------------------
+# The liquidity window the model is shown
+# ---------------------------------------------------------------------------
+
+
+def test_the_slow_ticks_liquidity_window_is_a_decision_interval(
+    tmp_path: Path, stub_network: MarketSnapshot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The regression for the 60-second liquidity trend.
+
+    Both ticks used to end by assigning ``self.previous``, and the slow tick built
+    its evidence against that — so the two snapshots actually being compared were
+    one *fast* tick apart. A pool shedding 10% of its depth across a decision
+    interval reached the model as -0.7%, which reads as noise, while the prompt
+    labelled it "trend vs last tick" and the system prompt calls a draining pool
+    the single most important thing that can happen to a position.
+
+    Only the real tick sequence catches that, so this runs one: decide, fourteen
+    fast ticks, decide.
+    """
+    cfg = make_cfg(tmp_path)
+    fast = cfg.cadence.fast_tick_seconds
+    slow = cfg.cadence.slow_tick_seconds
+    start = time.time() - slow  # so the last read lands at roughly "now"
+    elapsed = 0.0
+
+    def read(_cfg, **_kw) -> MarketSnapshot:
+        return snapshot(
+            replace(coin(), liquidity_usd=draining(slow, elapsed)),
+            ts=start + elapsed,
+        )
+
+    seen: list[dict] = []
+
+    def capture(cfg_, evidence, *_a, **_kw):
+        seen.append(evidence)
+        return hold_everything(cfg_), brain_usage()
+
+    monkeypatch.setattr(loop.market, "snapshot", read)
+    monkeypatch.setattr(loop.brain, "decide", capture)
+
+    trader = Trader(cfg, client=object())  # type: ignore[arg-type]
+    trader.slow_tick()
+    for step in range(1, slow // fast):  # fourteen fast ticks, a minute apart
+        elapsed = float(step * fast)
+        trader.fast_tick()
+
+    # The two references have to diverge here — that divergence is the fix. The
+    # fast ticks carried the freshest read forward and left the baseline alone.
+    assert trader.previous is not None
+    assert trader.previous.ts == pytest.approx(start + 14 * fast)
+    assert trader.decision_baseline is not None
+    assert trader.decision_baseline.ts == pytest.approx(start)
+
+    elapsed = float(slow)
+    trader.slow_tick()
+
+    assert len(seen) == 2, "both decisions must have reached the stubbed model"
+    first = seen[0]["BONK"].technicals.flow
+    assert first.liquidity_trend_pct is None, "the first decision has no baseline"
+    assert first.liquidity_trend_seconds is None, "and so no window either"
+
+    second = seen[1]["BONK"].technicals.flow
+    # The fast tick immediately before this one read
+    # 100_000 * (1 - 0.10 * 840/900) = $90,666.67, against which $90,000 is
+    # (90_000 - 90_666.67) / 90_666.67 = -0.735%: the noise-shaped number the
+    # defect handed the model instead of the drain it was looking at.
+    assert second.liquidity_trend_pct == pytest.approx(-10.0, abs=1e-9), (
+        "a fast-tick-wide window would have reported -0.735% here"
+    )
+    assert second.liquidity_trend_seconds == pytest.approx(float(slow), abs=1e-9)
+
+
+def test_a_failed_model_call_does_not_move_the_liquidity_baseline(
+    tmp_path: Path, stub_network: MarketSnapshot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tick that never reached the model is not a decision, so it must not
+    become the thing the next decision is measured against. The next successful
+    tick then reports the drain across the whole outage — and says the window was
+    that long, instead of claiming one cadence over evidence nobody read."""
+    cfg = make_cfg(tmp_path)
+    slow = cfg.cadence.slow_tick_seconds
+    start = time.time() - 2 * slow
+    elapsed = 0.0
+
+    def read(_cfg, **_kw) -> MarketSnapshot:
+        return snapshot(
+            replace(coin(), liquidity_usd=draining(slow, elapsed)),
+            ts=start + elapsed,
+        )
+
+    seen: list[dict] = []
+
+    def capture(cfg_, evidence, *_a, **_kw):
+        seen.append(evidence)
+        return hold_everything(cfg_), brain_usage()
+
+    monkeypatch.setattr(loop.market, "snapshot", read)
+    monkeypatch.setattr(loop.brain, "decide", capture)
+
+    trader = Trader(cfg, client=object())  # type: ignore[arg-type]
+    trader.slow_tick()  # the baseline read
+
+    elapsed = float(slow)
+    monkeypatch.setattr(
+        loop.brain, "decide",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("529 overloaded")),
+    )
+    assert trader.slow_tick().error is not None
+
+    elapsed = 2.0 * slow
+    monkeypatch.setattr(loop.brain, "decide", capture)
+    trader.slow_tick()
+
+    flow = seen[-1]["BONK"].technicals.flow
+    assert flow.liquidity_trend_pct == pytest.approx(-20.0, abs=1e-9)
+    assert flow.liquidity_trend_seconds == pytest.approx(2.0 * slow, abs=1e-9)
+
+
+def draining(slow: float, elapsed: float) -> float:
+    """Pool depth on a straight line from $100k to $90k across one decision
+    interval — a 10% drain, which no single 60-second step can see."""
+    return 100_000.0 * (1.0 - 0.10 * elapsed / slow)
+
+
+def decisions(cfg: config.Config) -> list[dict]:
+    if not cfg.decisions_path.is_file():
+        return []
+    return [
+        json.loads(line)
+        for line in cfg.decisions_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def hold_everything(cfg: config.Config):
+    """One HOLD per configured coin — the only decision that leaves the book
+    exactly as it was, which is what the cadence tests want to measure against."""
+    from memetrader.types import Action, TradeDecision
+
+    return TradeDecision(
+        market_read="holding",
+        actions=[
+            Action(action="HOLD", symbol=s, size_usd=0.0, confidence=0.3, reasoning="x")
+            for s in cfg.symbols
+        ],
+    )
+
+
+def brain_usage(*, thinking: str | None = None):
     from memetrader.brain import Usage
 
     return Usage(
         input_tokens=10, output_tokens=5,
         cache_read_input_tokens=0, cache_creation_input_tokens=0,
+        thinking=thinking,
     )
