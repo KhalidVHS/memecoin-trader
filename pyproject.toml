@@ -122,7 +122,10 @@ known-first-party = ["memetrader"]
 [tool.mypy]
 python_version = "3.14"
 files = ["src", "tests"]
-mypy_path = "src"
+# tools/ is on the path but not in `files`: the replay tools are importable
+# modules that tests/ exercises directly, so mypy has to resolve them, but they
+# are scripts rather than shipped library code and are not held to src/'s bar.
+mypy_path = ["src", "tools"]
 explicit_package_bases = true   # tests/ is a plain directory, not a package
 namespace_packages = true
 

@@ -13,6 +13,12 @@ data-v*/
 runs/
 .lastrun
 
+# Backfilled OHLCV. Large (~1.7M rows) and fully regenerable from
+# universe/solana_memecoins.toml, which *is* committed because it is the
+# definition of the experiment rather than its output. The manifest lives in
+# here too, so provenance travels with the data it describes.
+history/
+
 # Python
 __pycache__/
 *.py[cod]

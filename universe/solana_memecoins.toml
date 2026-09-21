@@ -1,0 +1,350 @@
+# Solana memecoin backtest universe
+#
+# The definition of the experiment. Committed deliberately: a backtest whose
+# universe is re-derived at run time is not reproducible, and a universe
+# scraped from today's leaderboard would exclude exactly the failures a
+# backtest must see. Coins that have since faded are kept on purpose.
+#
+# Resolved 2026-09-21T02:57:23Z against DexScreener.
+#
+# Method, and why it is not the obvious one:
+#   1. Start from a static, dated seed list of 38 established Solana
+#      memecoin tickers (predominantly 2023-2024 launches).
+#   2. Resolve each ticker to a MINT, then resolve the mint to a pool via
+#      GET /latest/dex/tokens/{mint}. Mint-first is essential. The
+#      /latest/dex/search endpoint cannot be trusted for resolution: for
+#      PNUT and MYRO it returned impostor vault tokens reusing the ticker,
+#      quoted in USDC, at $356M and $24M "liquidity" - crowding the real
+#      token out of the result page entirely. Their signature is
+#      liquidity/fdv ~= 1.00 (the whole supply sits in the one pool).
+#      The real PNUT has 30 pools and a liquidity/fdv of 0.067.
+#   3. Keep the deepest pool that is SOL-quoted, on a real AMM
+#      (raydium/orca/meteora incl. CLMM+DLMM), created on or before the
+#      2026-03-21 cutoff, with >= $250k liquidity.
+#
+# On liquidity_fdv_ratio: it is recorded, not filtered on. A ratio near 1.00
+# at large absolute size means impostor. But a ratio ABOVE 1.0 can be
+# genuine - SLERF (1.738) is the known case where the LP was burned, locking
+# liquidity permanently above market cap. SLERF and MICHI (1.046) were both
+# confirmed real by mint (16 and 5 independent pools). Filtering on the
+# ratio alone would have silently dropped them.
+#
+# BONK resolves to a $293k orca/SOL pool, the same one the live config
+# trades. Deeper BONK liquidity exists but is USDC-quoted and so outside
+# this screen. Consistent with live, but it is a thin pool for the size of
+# the token - relevant to price impact, flagged not fixed.
+#
+# BONK, WIF and POPCAT mints were cross-checked against config.toml
+# [[coins]] and match exactly.
+
+[meta]
+resolved_at = "2026-09-21T02:57:23Z"
+source = "dexscreener"
+endpoint = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
+seed_list_size = 38
+resolved_count = 24
+pool_created_cutoff = "2026-03-21"
+min_liquidity_usd = 250000.0
+required_quote = "SOL"
+allowed_dex = ["raydium", "orca", "meteora", "raydium-clmm", "meteora-dlmm"]
+
+[[coins]]
+symbol = "SLERF"
+mint = "7BgBvyjrZX1YKz4oh9mjb8ZScatkkwb8DzFx7LoiVkM3"
+pool = "AgFnRLUScRD2E4nWQxW73hdbSN7eKEUb2jHX7tx9YTYc"
+dex = "raydium"
+quote = "SOL"
+pool_created = "2024-03-18"
+liquidity_usd = 19000029.0
+fdv_usd = 10932060.0
+liquidity_fdv_ratio = 1.7380
+total_pools_seen = 16
+
+[[coins]]
+symbol = "BOME"
+mint = "ukHH6c7mMyiWCf1b9pnWe25TSpkDDt3H5pQZgZ74J82"
+pool = "DSUvc5qf5LJHHV5e2tD184ixotSnCnwj7i4jJa4Xsrmt"
+dex = "raydium"
+quote = "SOL"
+pool_created = "2024-03-14"
+liquidity_usd = 17040459.0
+fdv_usd = 67179292.0
+liquidity_fdv_ratio = 0.2537
+total_pools_seen = 30
+
+[[coins]]
+symbol = "MEW"
+mint = "MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5"
+pool = "879F697iuDJGMevRkRcnW21fcXiAeLJK1ffsw2ATebce"
+dex = "raydium"
+quote = "SOL"
+pool_created = "2024-03-26"
+liquidity_usd = 9157170.0
+fdv_usd = 37420909.0
+liquidity_fdv_ratio = 0.2447
+total_pools_seen = 21
+
+[[coins]]
+symbol = "WIF"
+mint = "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm"
+pool = "EP2ib6dYdEeqD8MfE2ezHCxX3kP3K2eLKkirfPm5eyMx"
+dex = "raydium"
+quote = "SOL"
+pool_created = "2023-11-20"
+liquidity_usd = 5907691.0
+fdv_usd = 201288565.0
+liquidity_fdv_ratio = 0.0293
+total_pools_seen = 30
+
+[[coins]]
+symbol = "POPCAT"
+mint = "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr"
+pool = "FRhB8L7Y9Qq41qZXYLtC2nw8An1RJfLLxRF2x9RwLLMo"
+dex = "raydium"
+quote = "SOL"
+pool_created = "2023-12-12"
+liquidity_usd = 3819110.0
+fdv_usd = 48665104.0
+liquidity_fdv_ratio = 0.0785
+total_pools_seen = 30
+
+[[coins]]
+symbol = "PNUT"
+mint = "2qEHjDLDLbuBgRYvsxhc5D6uDWAivNFZGan56P1tpump"
+pool = "4AZRPNEfCJ7iw28rJu5aUyeQhYcvdcNm8cswyL51AY9i"
+dex = "raydium"
+quote = "SOL"
+pool_created = "2024-10-31"
+liquidity_usd = 3517505.0
+fdv_usd = 52400144.0
+liquidity_fdv_ratio = 0.0671
+total_pools_seen = 30
+
+[[coins]]
+symbol = "MOODENG"
+mint = "ED5nyyWEzpPPiWimP8vYm7sD7TD3LAt3Q3gRTWHzPJBY"
+pool = "22WrmyTj8x2TRVQen3fxxi2r4Rn6JDHWoMTpsSmn8RUd"
+dex = "raydium"
+quote = "SOL"
+pool_created = "2024-09-10"
+liquidity_usd = 2870582.0
+fdv_usd = 43871414.0
+liquidity_fdv_ratio = 0.0654
+total_pools_seen = 30
+
+[[coins]]
+symbol = "GIGA"
+mint = "63LfDmNb3MQ8mw9MtZ2To9bEA2M71kZUUGq5tiJxcqj9"
+pool = "4xxM4cdb6MEsCxM52xvYqkNbzvdeWWsPDZrBcTqVGUar"
+dex = "raydium"
+quote = "SOL"
+pool_created = "2024-01-04"
+liquidity_usd = 1674917.0
+fdv_usd = 20347860.0
+liquidity_fdv_ratio = 0.0823
+total_pools_seen = 30
+
+[[coins]]
+symbol = "AURA"
+mint = "DtR4D9FtVoTX2569gaL837ZgrB6wNjj6tkmnX9Rdk9B2"
+pool = "9ViX1VductEoC2wERTSp2TuDxXPwAf69aeET8ENPJpsN"
+dex = "raydium"
+quote = "SOL"
+pool_created = "2024-05-30"
+liquidity_usd = 1643472.0
+fdv_usd = 10714639.0
+liquidity_fdv_ratio = 0.1534
+total_pools_seen = 30
+
+[[coins]]
+symbol = "GOAT"
+mint = "CzLSujWBLFsSjncfkh59rUFqvafWcY5tzedWJSuypump"
+pool = "9Tb2ohu5P16BpBarqd3N27WnkF51Ukfs8Z1GzzLDxVZW"
+dex = "raydium"
+quote = "SOL"
+pool_created = "2024-10-10"
+liquidity_usd = 1639681.0
+fdv_usd = 17180625.0
+liquidity_fdv_ratio = 0.0954
+total_pools_seen = 30
+
+[[coins]]
+symbol = "CHILLGUY"
+mint = "Df6yfrKC8kZE3KNkrHERKzAetSxbrWeniQfyJY4Jpump"
+pool = "93tjgwff5Ac5ThyMi8C4WejVVQq4tuMeMuYW1LEYZ7bu"
+dex = "raydium"
+quote = "SOL"
+pool_created = "2024-11-15"
+liquidity_usd = 1555324.0
+fdv_usd = 13700088.0
+liquidity_fdv_ratio = 0.1135
+total_pools_seen = 30
+
+[[coins]]
+symbol = "PONKE"
+mint = "5z3EqYQo9HiCEs3R84RCDMu2n7anpDMxRhdK8PSWmrRC"
+pool = "5uTwG3y3F5cx4YkodgTjWEHDrX5HDKZ5bZZ72x8eQ6zE"
+dex = "raydium"
+quote = "SOL"
+pool_created = "2023-12-24"
+liquidity_usd = 1533266.0
+fdv_usd = 12499719.0
+liquidity_fdv_ratio = 0.1227
+total_pools_seen = 16
+
+[[coins]]
+symbol = "ACT"
+mint = "GJAFwWjJ3vnTsrQVabjBVK2TYB1YtRCQXRDfDgUnpump"
+pool = "B4PHSkL6CeZbxVqm1aUPQuVpc5ERFcaZj7u9dhtphmVX"
+dex = "raydium"
+quote = "SOL"
+pool_created = "2024-10-19"
+liquidity_usd = 1494938.0
+fdv_usd = 9870065.0
+liquidity_fdv_ratio = 0.1515
+total_pools_seen = 15
+
+[[coins]]
+symbol = "FWOG"
+mint = "A8C3xuqscfmyLrte3VmTqrAq8kgMASius9AFNANwpump"
+pool = "AB1eu2L1Jr3nfEft85AuD2zGksUbam1Kr8MR3uM2sjwt"
+dex = "raydium"
+quote = "SOL"
+pool_created = "2024-07-30"
+liquidity_usd = 1401865.0
+fdv_usd = 4042600.0
+liquidity_fdv_ratio = 0.3468
+total_pools_seen = 26
+
+[[coins]]
+symbol = "GME"
+mint = "8wXtPeU6557ETkp9WHFY1n1EcU6NxDvbAggHGsMYiHsB"
+pool = "9tz6vYKiBDLYx2RnGWC5tESu4pyVE4jD6Tm56352UGte"
+dex = "raydium"
+quote = "SOL"
+pool_created = "2024-01-27"
+liquidity_usd = 1249032.0
+fdv_usd = 3508076.0
+liquidity_fdv_ratio = 0.3560
+total_pools_seen = 21
+
+[[coins]]
+symbol = "DADDY"
+mint = "4Cnk9EPnW5ixfLZatCPJjDB1PUtcRpVVgTQukm9epump"
+pool = "zcdAw3jpcqEY8JYVxNVMqs2cU35cyDdy4ot7V8edNhz"
+dex = "raydium"
+quote = "SOL"
+pool_created = "2024-06-09"
+liquidity_usd = 892982.0
+fdv_usd = 5902018.0
+liquidity_fdv_ratio = 0.1513
+total_pools_seen = 10
+
+[[coins]]
+symbol = "MICHI"
+mint = "5mbK36SZ7J19An8jFochhQS4of8g6BwUjbeCSxBSoWdp"
+pool = "GH8Ers4yzKR3UKDvgVu8cqJfGzU4cU62mTeg9bcJ7ug6"
+dex = "raydium"
+quote = "SOL"
+pool_created = "2024-04-08"
+liquidity_usd = 412293.0
+fdv_usd = 394271.0
+liquidity_fdv_ratio = 1.0457
+total_pools_seen = 5
+
+[[coins]]
+symbol = "SC"
+mint = "6D7NaB2xsLd7cauWu1wKk6KBsJohJmP2qZH9GEfVi5Ui"
+pool = "BSzedbEvWRqVksaF558epPWCM16avEpyhm2HgSq9WZyy"
+dex = "raydium"
+quote = "SOL"
+pool_created = "2024-03-26"
+liquidity_usd = 378378.0
+fdv_usd = 1105096.0
+liquidity_fdv_ratio = 0.3424
+total_pools_seen = 8
+
+[[coins]]
+symbol = "BILLY"
+mint = "3B5wuUrMEi5yATD7on46hKfej3pfmd7t1RKgrsN3pump"
+pool = "9uWW4C36HiCTGr6pZW9VFhr9vdXktZ8NA8jVnzQU35pJ"
+dex = "raydium"
+quote = "SOL"
+pool_created = "2024-06-17"
+liquidity_usd = 373684.0
+fdv_usd = 479720.0
+liquidity_fdv_ratio = 0.7790
+total_pools_seen = 7
+
+[[coins]]
+symbol = "RETARDIO"
+mint = "6ogzHhzdrQr9Pgv6hZ2MNze7UrzBMAFyBBWUYp1Fhitx"
+pool = "5eLRsN6qDQTQSBF8KdW4B8mVpeeAzHCCwaDptzMyszxH"
+dex = "raydium"
+quote = "SOL"
+pool_created = "2024-02-01"
+liquidity_usd = 369181.0
+fdv_usd = 1600284.0
+liquidity_fdv_ratio = 0.2307
+total_pools_seen = 30
+
+[[coins]]
+symbol = "BODEN"
+mint = "3psH1Mj1f7yUfaD5gh6Zj7epE8hhrMkMETgv5TshQA4o"
+pool = "6UYbX1x8YUcFj8YstPYiZByG7uQzAq2s46ZWphUMkjg5"
+dex = "raydium"
+quote = "SOL"
+pool_created = "2024-03-03"
+liquidity_usd = 339786.0
+fdv_usd = 945560.0
+liquidity_fdv_ratio = 0.3593
+total_pools_seen = 12
+
+[[coins]]
+symbol = "LOCKIN"
+mint = "8Ki8DpuWNxu9VsS3kQbarsCWMcFGWkzzA8pUPto9zBd5"
+pool = "AtWMAA6T9t8cq8XCccCFPGDNNQYXhScuNuY6WVRi7FKe"
+dex = "raydium"
+quote = "SOL"
+pool_created = "2024-03-16"
+liquidity_usd = 313800.0
+fdv_usd = 1191296.0
+liquidity_fdv_ratio = 0.2634
+total_pools_seen = 18
+
+[[coins]]
+symbol = "BONK"
+mint = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+pool = "5zpyutJu9ee6jFymDGoK7F6S5Kczqtc9FomP3ueKuyA9"
+dex = "orca"
+quote = "SOL"
+pool_created = "2022-12-25"
+liquidity_usd = 292709.0
+fdv_usd = 267191679.0
+liquidity_fdv_ratio = 0.0011
+total_pools_seen = 30
+
+[[coins]]
+symbol = "MOTHER"
+mint = "3S8qX1MsMqRbiwKg2cQyx7nis1oHMgaCuc9c4VfvVdPN"
+pool = "HcPgh6B2yHNvT6JsEmkrHYT8pVHu9Xiaoxm4Mmn2ibWw"
+dex = "raydium"
+quote = "SOL"
+pool_created = "2024-05-28"
+liquidity_usd = 258022.0
+fdv_usd = 350440.0
+liquidity_fdv_ratio = 0.7363
+total_pools_seen = 2
+
+# Seeded but NOT resolved. Recorded so the screen is auditable and so a
+# later run can tell "we never looked" from "we looked and it did not
+# qualify" - the projects missing-is-never-zero invariant applied to the
+# universe itself.
+#
+# Verified by mint, real token, best SOL-quoted pool below the $250k floor:
+#   MYRO  $120,914 (2023-11-09)   WEN  $74,550 (2024-01-26)
+#   SAMO  $14,487 (2022-12-30)
+#
+# Not resolved by the screen; no mint confirmed, so no liquidity figure is
+# claimed for them:
+#   HARAMBE, TREMP, NUB, SILLY, SMOG, HAMMY, SPIKE, BAG, MUMU, ANALOS, SHARK

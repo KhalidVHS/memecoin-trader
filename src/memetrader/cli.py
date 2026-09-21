@@ -20,17 +20,21 @@ places an order, dies, restarts and places it again.
 from __future__ import annotations
 
 import dataclasses
+import datetime as dt
 import logging
 import time
 from collections.abc import Sequence
+from pathlib import Path
 
 import typer
 from rich.logging import RichHandler
 
+from . import backfill as backfill_mod
 from . import config as config_mod
 from . import market, portfolio, report
 from .broker import LiveModeUnsupported
 from .config import Config
+from .http import make_client
 from .loop import StartupRefusal, TickResult, Trader
 from .report import console
 from .types import (
@@ -39,6 +43,7 @@ from .types import (
     MarketSnapshot,
     PortfolioState,
     TargetPosition,
+    Timeframe,
 )
 
 app = typer.Typer(
@@ -505,6 +510,96 @@ def _render_tick(result: TickResult, cfg: Config) -> None:
             f"[yellow]{result.mode.value} — orders were priced and bounded but "
             f"nothing was executed and nothing was written[/yellow]"
         )
+
+
+@app.command(name="backfill")
+def backfill_cmd(
+    since: str = typer.Option(
+        ..., "--since", help="Earliest bar to keep, YYYY-MM-DD (UTC)."
+    ),
+    universe: str = typer.Option(
+        "universe/solana_memecoins.toml",
+        "--universe",
+        help="Committed universe file: the definition of the experiment.",
+    ),
+    timeframes: str = typer.Option(
+        "1h,5m", "--timeframes", "-t", help="Comma-separated: 1h, 5m, or both."
+    ),
+    out: str = typer.Option("history", "--out", help="Output root."),
+    resume: bool = typer.Option(
+        False, "--resume", help="Skip pairs the manifest already covers."
+    ),
+    pace: float = typer.Option(
+        backfill_mod.DEFAULT_PACE_SECONDS,
+        "--pace",
+        help="Seconds between calls. 429s begin around 2.1s on the keyless tier.",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Download historical OHLCV for backtesting. Writes closed bars only.
+
+    Long-running and resumable: a full 1h+5m pull over ~24 coins is roughly an
+    hour of wall clock, almost all of it spent pacing to stay under the keyless
+    rate limit. ``--resume`` makes an interrupted run cheap to restart, and the
+    manifest is rewritten after every series so a run killed partway through
+    still describes exactly the files that exist.
+    """
+    _setup_logging(verbose)
+    cfg = _load("read_only")
+    root = Path(out)
+
+    try:
+        frames = [Timeframe(v.strip()) for v in timeframes.split(",") if v.strip()]
+    except ValueError as exc:
+        console.print(f"[red]unsupported timeframe: {exc}[/red]")
+        raise typer.Exit(2) from exc
+    if not frames:
+        console.print("[red]--timeframes is empty[/red]")
+        raise typer.Exit(2)
+
+    try:
+        start = dt.datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=dt.UTC)
+    except ValueError as exc:
+        console.print(f"[red]--since must be YYYY-MM-DD: {exc}[/red]")
+        raise typer.Exit(2) from exc
+
+    coins = backfill_mod.load_universe(Path(universe))
+    console.print(
+        f"[dim]{len(coins)} coins x {len(frames)} timeframes since {since} -> {root}[/dim]"
+    )
+
+    with make_client(cfg.data.http_timeout_seconds) as client:
+        result = backfill_mod.backfill(
+            client,
+            coins=coins,
+            timeframes=frames,
+            since=start.timestamp(),
+            root=root,
+            base_url=cfg.data.geckoterminal_base,
+            resume=resume,
+            pace_seconds=pace,
+            on_progress=lambda label: console.print(f"[dim]  {label}[/dim]"),
+        )
+
+    for meta in result.written:
+        # Gaps are reported, never closed up: a "20-bar" window that actually
+        # spans 26 bars of wall clock has to be visible to whoever reads this.
+        note = f" [yellow]{meta.missing_bars} missing[/yellow]" if meta.missing_bars else ""
+        console.print(
+            f"  {meta.symbol:9s} {meta.timeframe:3s} {meta.rows:>7,} rows "
+            f"in {meta.pages} pages{note}"
+        )
+    if result.skipped:
+        console.print(f"[dim]skipped {len(result.skipped)} already-complete[/dim]")
+    for label, reason in result.failed:
+        console.print(f"[red]  {label}: {reason}[/red]")
+
+    console.print(
+        f"[bold]{len(result.written)} written, {len(result.skipped)} skipped, "
+        f"{len(result.failed)} failed[/bold]"
+    )
+    if result.failed and not result.written:
+        raise typer.Exit(1)
 
 
 if __name__ == "__main__":
