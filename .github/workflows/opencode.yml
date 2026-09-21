@@ -1,0 +1,58 @@
+name: OpenCode Agent
+
+on:
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created]
+  pull_request:
+    types: [opened, edited]
+  pull_request_review_comment:
+    types: [created]
+
+jobs:
+  opencode:
+    # Only run when comment/issue body contains @opencode trigger
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@opencode')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@opencode')) ||
+      (github.event_name == 'issues' && contains(github.event.issue.body, '@opencode')) ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.body, '@opencode'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install opencode
+        run: npm install -g opencode-ai
+
+      - name: Extract prompt
+        id: prompt
+        run: |
+          if [ "${{ github.event_name }}" = "issue_comment" ] || [ "${{ github.event_name }}" = "pull_request_review_comment" ]; then
+            BODY="${{ github.event.comment.body }}"
+          elif [ "${{ github.event_name }}" = "issues" ]; then
+            BODY="${{ github.event.issue.body }}"
+          else
+            BODY="${{ github.event.pull_request.body }}"
+          fi
+          # Strip the @opencode trigger and pass remaining text as the prompt
+          PROMPT=$(echo "$BODY" | sed 's/@opencode//' | xargs)
+          echo "prompt=$PROMPT" >> $GITHUB_OUTPUT
+
+      - name: Run opencode
+        env:
+          LLM_GATEWAY_KEY: ${{ secrets.LLM_GATEWAY_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          opencode run --auto "${{ steps.prompt.outputs.prompt }}"
