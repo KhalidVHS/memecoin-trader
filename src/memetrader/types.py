@@ -243,10 +243,34 @@ class Provenance:
                          is a lie that makes stale data look current.
     * ``source_time``  — when the source says it computed the value.
     * ``receive_time`` — when this process finished reading it. Always known.
+    * ``available_time`` — the earliest simulated clock at which a *replay* is
+                         permitted to look at this value. See below.
 
     ``age_seconds`` deliberately measures from the *oldest* known time, so a
     source that omits ``event_time`` cannot look fresher than one that reports
     it honestly.
+
+    ``available_time`` is the backtest's central invariant and it is a different
+    question from every other field here. ``event_time`` asks "when was this
+    true?"; ``available_time`` asks "when could this system first have acted on
+    it?". The two diverge constantly and the gap is always the direction that
+    flatters a backtest: an hourly candle is *true* from its open timestamp but
+    is not knowable until it closes and the vendor publishes it, and a social
+    post created at 10:00 but collected at 10:03 was not available at 10:00.
+    Replaying against ``event_time`` silently grants the strategy three minutes
+    of foresight, which on a 0.2% hurdle is the entire edge.
+
+    It defaults to ``None`` rather than to ``receive_time`` so that the gap is
+    visible: ``available_at`` falls back to ``receive_time``, which is the
+    honest floor for a live read (you had it once you received it), while a
+    backfilled row must set it explicitly to close-plus-publication-delay. A
+    default of "available when the event happened" would have been the one
+    choice that leaks.
+
+    ``sequence`` is the source's own ordering token — a Solana slot, a block
+    height, a vendor cursor. It breaks ties deterministically when two records
+    share an ``available_time``, which is what makes a replay reproducible
+    rather than dependent on dict iteration order.
     """
 
     source: str
@@ -255,11 +279,20 @@ class Provenance:
     source_time: float | None = None
     quality: DataQuality = DataQuality.OK
     quality_reason: str | None = None
+    available_time: float | None = None
+    sequence: int | None = None
 
     def __post_init__(self) -> None:
         finite(self.receive_time, "receive_time")
         finite_or_none(self.event_time, "event_time")
         finite_or_none(self.source_time, "source_time")
+        finite_or_none(self.available_time, "available_time")
+
+    @property
+    def available_at(self) -> float:
+        """The earliest simulated time this value may be read. Never earlier
+        than ``receive_time`` unless a loader states otherwise explicitly."""
+        return self.available_time if self.available_time is not None else self.receive_time
 
     @property
     def effective_time(self) -> float:
@@ -1174,12 +1207,31 @@ class Forecast:
     calibration_id: str | None = None
     features_missing: tuple[str, ...] = ()
     note: str = ""
+    # When this view goes stale. A forecast generated from a bar that closed at
+    # 10:00 with a one-hour horizon is not still actionable at 11:30, and a
+    # replay that lets a queued order fill against a forecast the live system
+    # would have discarded is measuring a strategy nobody could run. ``None``
+    # means the producer makes no staleness claim.
+    valid_until: float | None = None
+    # P(return > 0) at this horizon. Distinct from the quantiles: a forecast can
+    # be confidently small-positive or barely-positive-but-huge, and sizing
+    # should be able to tell those apart. ``None`` for a model making no
+    # probabilistic claim — a baseline point estimate must not be read as 100%.
+    probability_positive: float | None = None
 
     def __post_init__(self) -> None:
         positive(self.horizon_seconds, "horizon_seconds")
         finite_or_none(self.expected_net_return_pct, "expected_net_return_pct")
         finite_or_none(self.lower_quantile_pct, "lower_quantile_pct")
         finite_or_none(self.upper_quantile_pct, "upper_quantile_pct")
+        finite_or_none(self.valid_until, "valid_until")
+        finite_or_none(self.probability_positive, "probability_positive")
+        if self.probability_positive is not None and not (
+            0.0 <= self.probability_positive <= 1.0
+        ):
+            raise ValidationError(
+                f"probability_positive {self.probability_positive} outside [0, 1]"
+            )
 
     @property
     def actionable(self) -> bool:
@@ -1317,24 +1369,254 @@ class EvidenceBundle:
     mark: Mark | None = None
 
 
+# ---------------------------------------------------------------------------
+# Replay — owned by backtest/, consumed by histdata/ and execution/
+# ---------------------------------------------------------------------------
+
+
+class FidelityTier(StrEnum):
+    """How much of a PnL claim the available data can actually support.
+
+    This exists because the most dangerous output of a backtest is a number
+    that looks like dollars but was computed from data that cannot price a
+    swap. Solana execution depends on size-specific AMM depth, route
+    availability, priority fees and whether the transaction landed at all.
+    OHLCV knows none of that, so a bar-based fill is an estimate of *signal*,
+    not of *money*, and every artifact derived from one must say so.
+
+    The tier is carried on the run manifest and on every execution report, and
+    :mod:`memetrader.validation.promotion` refuses to promote below TIER_2.
+    """
+
+    # Candles only. What this repository currently has: 24 coins, 1h and 5m,
+    # bounded by the vendor's 180-day public horizon.
+    TIER_0 = "tier_0_ohlcv"
+    # Individual swaps/trades plus conservative cost estimates.
+    TIER_1 = "tier_1_swaps"
+    # Historical pool states or exact size-specific quote ladders.
+    TIER_2 = "tier_2_executable"
+    # Prospective shadow quotes and observed landed/failed transactions, used
+    # to calibrate the TIER_2 simulator against reality.
+    TIER_3 = "tier_3_calibrated"
+
+    @property
+    def permits_pnl_claim(self) -> bool:
+        return self in (FidelityTier.TIER_2, FidelityTier.TIER_3)
+
+
+# The exact sentence a run must print when its tier cannot price a swap. It is
+# a constant so that no report can quietly soften the wording.
+NON_EXECUTABLE_NOTICE = (
+    "This experiment estimates signal quality, but executable after-cost PnL "
+    "has not been demonstrated."
+)
+
+
+class EventKind(StrEnum):
+    """What a replayed event is. Ordering within one timestamp depends on it."""
+
+    UNIVERSE = "universe"
+    BAR_CLOSE = "bar_close"
+    POOL_STATE = "pool_state"
+    SWAP = "swap"
+    QUOTE = "quote"
+    SOCIAL = "social"
+    MARK = "mark"
+    DECISION_TICK = "decision_tick"
+    ORDER_READY = "order_ready"
+    EXECUTION = "execution"
+
+
+# Deterministic intra-timestamp ordering. Every state update lands before the
+# decision that reads it, and the decision lands before any order it produces —
+# so a strategy cannot act on a bar in the same breath as that bar arriving,
+# even when both carry an identical ``available_time``. The gaps leave room to
+# insert kinds later without renumbering.
+EVENT_PRIORITY: dict[EventKind, int] = {
+    EventKind.UNIVERSE: 0,
+    EventKind.BAR_CLOSE: 10,
+    EventKind.POOL_STATE: 20,
+    EventKind.SWAP: 30,
+    EventKind.QUOTE: 40,
+    EventKind.SOCIAL: 50,
+    EventKind.MARK: 60,
+    EventKind.DECISION_TICK: 70,
+    EventKind.ORDER_READY: 80,
+    EventKind.EXECUTION: 90,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalEvent:
+    """One thing that became knowable at ``available_time``.
+
+    The replay queue is sorted by :attr:`sort_key` and nothing else. Note what
+    is *not* in the key: ``event_time``. Sorting a replay by when things
+    happened rather than by when they were knowable is the single most common
+    way a backtest grants itself foresight, and it is invisible in the results
+    because the equity curve still looks like a plausible equity curve.
+    """
+
+    kind: EventKind
+    available_time: float
+    asset_id: str | None
+    payload: object
+    event_time: float | None = None
+    received_time: float | None = None
+    sequence: int | None = None
+    source: str = ""
+    pool_id: str | None = None
+    quality_flags: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        finite(self.available_time, "available_time")
+        finite_or_none(self.event_time, "event_time")
+        finite_or_none(self.received_time, "received_time")
+        if self.event_time is not None and self.event_time > self.available_time:
+            raise ValidationError(
+                f"{self.kind} for {self.asset_id}: event_time {self.event_time} is after "
+                f"available_time {self.available_time} — an event cannot be knowable "
+                "before it happens"
+            )
+
+    @property
+    def sort_key(self) -> tuple[float, int, int, str, str]:
+        """Total order over events. Must be deterministic for replay equality."""
+        return (
+            self.available_time,
+            EVENT_PRIORITY[self.kind],
+            self.sequence if self.sequence is not None else -1,
+            self.source,
+            self.asset_id or "",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CostBreakdown:
+    """Where a trade's money went, split so attribution can subtract it.
+
+    Every field is signed rather than non-negative: ``latency_cost_usd`` is
+    genuinely negative when the delay happened to help, and clamping it at zero
+    would make latency look like a one-way tax and overstate the strategy's
+    gross alpha by exactly the favourable half of the distribution.
+    """
+
+    venue_fee_usd: float = 0.0
+    network_fee_usd: float = 0.0
+    priority_fee_usd: float = 0.0
+    spread_usd: float = 0.0
+    price_impact_usd: float = 0.0
+    latency_cost_usd: float = 0.0
+    failure_cost_usd: float = 0.0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "venue_fee_usd",
+            "network_fee_usd",
+            "priority_fee_usd",
+            "spread_usd",
+            "price_impact_usd",
+            "latency_cost_usd",
+            "failure_cost_usd",
+        ):
+            finite(getattr(self, name), f"cost.{name}")
+
+    @property
+    def total_usd(self) -> float:
+        return (
+            self.venue_fee_usd
+            + self.network_fee_usd
+            + self.priority_fee_usd
+            + self.spread_usd
+            + self.price_impact_usd
+            + self.latency_cost_usd
+            + self.failure_cost_usd
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OrderReceipt:
+    """The venue's acknowledgement that an order was accepted for execution.
+
+    Separate from the fill because acceptance and settlement are separate
+    facts separated by time, and collapsing them is how a simulator ends up
+    filling an order the real network would have dropped. ``ready_at`` is when
+    the order may first meet a market state — submission time plus quote,
+    signing and landing latency.
+    """
+
+    receipt_id: str
+    intent_id: str
+    accepted: bool
+    submitted_at: float
+    ready_at: float
+    quote_fingerprint: str | None = None
+    reason: str = ""
+
+    def __post_init__(self) -> None:
+        finite(self.submitted_at, "submitted_at")
+        finite(self.ready_at, "ready_at")
+        if self.ready_at < self.submitted_at:
+            raise ValidationError(
+                f"ready_at {self.ready_at} precedes submitted_at {self.submitted_at}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionReport:
+    """What a venue reports back about one order attempt.
+
+    ``report_id`` is the idempotency key: a venue may legitimately emit the
+    same report twice and the ledger must treat the second as a no-op rather
+    than as a second fill. ``fill`` is ``None`` for a terminal non-fill —
+    a failed route, an expired quote, a dropped transaction — and that is a
+    real, costly outcome, not an absence to be skipped.
+    """
+
+    report_id: str
+    intent_id: str
+    order_id: str | None
+    state: OrderState
+    ts: float
+    fidelity: FidelityTier
+    fill: Fill | None = None
+    costs: CostBreakdown | None = None
+    reason: str = ""
+
+    def __post_init__(self) -> None:
+        finite(self.ts, "execution_report.ts")
+        if self.fill is not None and self.fill.state is not self.state:
+            raise ValidationError(
+                f"report state {self.state} disagrees with fill state {self.fill.state}"
+            )
+
+
 __all__ = [
+    "EVENT_PRIORITY",
+    "NON_EXECUTABLE_NOTICE",
     "AdvisoryAction",
     "AdvisoryDecision",
     "Broker",
     "Candle",
     "CandleSeries",
     "CoinSnapshot",
+    "CostBreakdown",
     "DataQuality",
     "DecisionRecord",
+    "EventKind",
     "EvidenceBundle",
     "ExecutionMode",
+    "ExecutionReport",
+    "FidelityTier",
     "Fill",
     "FlowBrief",
     "Forecast",
+    "HistoricalEvent",
     "Mark",
     "MarketSnapshot",
     "Observed",
     "OrderIntent",
+    "OrderReceipt",
     "OrderState",
     "PoolRef",
     "PortfolioState",

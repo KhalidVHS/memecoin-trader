@@ -1,0 +1,69 @@
+# Execution stress test: 1x / 2x / 3x costs, elevated failed_tx_rate.
+#
+# Purpose: determine whether the signal survives realistic and pessimistic cost
+# assumptions.  A strategy that is profitable at 1x but not at 2x is a strategy
+# that depends on cost assumptions being optimistic — not the same as a strategy
+# that is robust.
+#
+# Differences from baseline_price_volume:
+#
+#   * cost_stress_multipliers = [1, 2, 3]  — the runner applies each in turn.
+#   * latency.failed_tx_rate = 0.12  — twice the empirical rate, testing the
+#     upper tail of Solana congestion.
+#   * latency.sigma = 0.7  — wider distribution models tail latency days.
+#   * publication_delay_seconds = 120  — tests sensitivity to slower data delivery.
+
+[run]
+label = "execution_stress"
+run_id_prefix = "exec_stress"
+
+[date_range]
+start_ts = 1_717_200_000  # 2024-06-01 00:00 UTC
+end_ts   = 1_735_084_800  # 2024-12-25 00:00 UTC
+
+[data]
+universe_version = "v1"
+timeframes = ["5m", "1h"]
+
+[cadence]
+fast_tick_seconds     = 300
+decision_tick_seconds = 900
+
+[portfolio]
+starting_cash_usd = 1000.0
+
+[execution]
+publication_delay_seconds = 120.0
+execution_model  = "ohlcv_midpoint"
+execution_mode   = "paper"
+fidelity_tier    = "tier_0_ohlcv"
+
+[execution.latency]
+# Pessimistic distribution: higher sigma + doubled failure rate.
+# The goal is not realism but stress: if the strategy survives these
+# costs, the cost model uncertainty does not drive the conclusion.
+mu             = -1.0
+sigma          = 0.7
+failed_tx_rate = 0.12
+
+[folds]
+train_seconds   = 7_776_000   # 90 days
+val_seconds     = 2_592_000   # 30 days
+test_seconds    = 2_592_000   # 30 days
+roll_seconds    = 2_592_000   # 30 days
+embargo_seconds = 172_800     # 2 days
+n_outer_folds   = 3
+holdout_seconds  = 3_888_000  # 45 days
+holdout_min_pct  = 0.20
+
+[holdout]
+opened = false
+
+[seeds]
+latency_draw  = 200
+failed_tx     = 201
+strategy_rng  = 202
+
+[cost_stress]
+# The three canonical multipliers from BACKTEST-CONTRACTS.md §6.
+multipliers = [1, 2, 3]

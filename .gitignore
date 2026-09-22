@@ -1,5 +1,8 @@
-# Runtime state — never commit a trading ledger
-data/
+# Runtime state — never commit a trading ledger.
+# Anchored with a leading slash: an unanchored `data/` matches a directory of
+# that name at *any* depth, so it silently swallowed `src/memetrader/data/`.
+# Only the repository-root runtime directory was ever meant to be ignored.
+/data/
 # Books left behind by a schema change. The post-audit state format is not
 # readable by the old loader and vice versa, so an incompatible book is moved
 # aside rather than deleted; it is still runtime state and still must not be

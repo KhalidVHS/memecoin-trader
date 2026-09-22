@@ -1,0 +1,76 @@
+# Baseline backtest: price-volume signals only, OHLCV fidelity.
+#
+# This is the control run against which every more complex strategy must
+# demonstrate a statistically significant improvement.  It uses the simplest
+# execution model (OHLCV midpoint), no cost stress, and a single seed so the
+# result is fully reproducible.
+#
+# Run with:
+#   uv run python -m memetrader.cli_backtest run configs/backtests/baseline_price_volume.toml
+
+[run]
+label = "baseline_price_volume"
+run_id_prefix = "baseline_pv"
+
+[date_range]
+# Epoch seconds.  These bracket the full 209-day 1h history available at
+# TIER_0.  Adjust when a longer data pull has been completed.
+start_ts = 1_717_200_000  # 2024-06-01 00:00 UTC
+end_ts   = 1_735_084_800  # 2024-12-25 00:00 UTC
+
+[data]
+universe_version = "v1"
+timeframes = ["5m", "1h"]
+
+[cadence]
+# Mirror the live system: a fast tick every 5 min for execution checks,
+# a decision tick every 15 min when the strategy actually runs.
+fast_tick_seconds     = 300
+decision_tick_seconds = 900
+
+[portfolio]
+starting_cash_usd = 1000.0
+
+[execution]
+publication_delay_seconds = 60.0
+# ohlcv_midpoint is the only ExecutionModel available at TIER_0.  It fills
+# at the bar's midpoint price and cannot model price impact or depth.
+execution_model  = "ohlcv_midpoint"
+execution_mode   = "paper"
+fidelity_tier    = "tier_0_ohlcv"
+
+[execution.latency]
+# Log-normal parameters fitted from shadow data collected 2026-09-01 to
+# 2026-09-19.  mu=-1.5, sigma=0.4 => median latency ~0.22 s, 95th pct ~0.7 s.
+mu              = -1.5
+sigma           = 0.4
+failed_tx_rate  = 0.06
+
+[folds]
+# Outer walk-forward folds.  Starting values as per §7 of BACKTEST-CONTRACTS.md.
+train_seconds   = 7_776_000   # 90 days
+val_seconds     = 2_592_000   # 30 days
+test_seconds    = 2_592_000   # 30 days
+roll_seconds    = 2_592_000   # 30 days
+embargo_seconds = 172_800     # 2 days: max holding period + publication lag
+n_outer_folds   = 3
+
+[folds]
+holdout_seconds  = 3_888_000  # 45 days — below the plan's 90-day recommendation
+holdout_min_pct  = 0.20       # at least 20 % of the record
+
+[holdout]
+# Set to true in the registry when a researcher inspects the holdout.
+# Once true, revising results invalidates the experiment.
+opened = false
+
+[seeds]
+# One seed per independent RNG stream.  Streams not listed here are seeded
+# deterministically from the run_id via SimulatedClock.deterministic_seed.
+latency_draw  = 42
+failed_tx     = 43
+strategy_rng  = 44
+
+[cost_stress]
+# Baseline uses only 1x costs.  The execution_stress config varies these.
+multipliers = [1]

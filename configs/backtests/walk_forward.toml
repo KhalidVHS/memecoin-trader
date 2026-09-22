@@ -1,0 +1,65 @@
+# Walk-forward validation: multiple outer folds with purge and embargo.
+#
+# This config is the standard validation harness.  The distinguishing features
+# vs. baseline_price_volume:
+#
+#   * n_outer_folds = 5  — more folds reduce variance in the performance estimate.
+#   * embargo_seconds = 259200 (3 days) — wider than baseline because this run
+#     is meant for strategies with longer holding horizons where feature carryover
+#     is larger.
+#   * All three cost_stress_multipliers present so a single run produces the 1x,
+#     2x and 3x cost-stress results at once.
+#
+# The fold lengths are shorter than baseline to fit within the 209-day record
+# while leaving room for an uncontaminated holdout.
+
+[run]
+label = "walk_forward"
+run_id_prefix = "wf"
+
+[date_range]
+start_ts = 1_717_200_000  # 2024-06-01 00:00 UTC
+end_ts   = 1_735_084_800  # 2024-12-25 00:00 UTC
+
+[data]
+universe_version = "v1"
+timeframes = ["5m", "1h"]
+
+[cadence]
+fast_tick_seconds     = 300
+decision_tick_seconds = 900
+
+[portfolio]
+starting_cash_usd = 1000.0
+
+[execution]
+publication_delay_seconds = 60.0
+execution_model  = "ohlcv_midpoint"
+execution_mode   = "paper"
+fidelity_tier    = "tier_0_ohlcv"
+
+[execution.latency]
+mu             = -1.5
+sigma          = 0.4
+failed_tx_rate = 0.06
+
+[folds]
+train_seconds   = 5_184_000   # 60 days
+val_seconds     = 1_728_000   # 20 days
+test_seconds    = 1_728_000   # 20 days
+roll_seconds    = 1_728_000   # 20 days
+embargo_seconds = 259_200     # 3 days
+n_outer_folds   = 5
+holdout_seconds  = 3_888_000  # 45 days
+holdout_min_pct  = 0.20
+
+[holdout]
+opened = false
+
+[seeds]
+latency_draw  = 100
+failed_tx     = 101
+strategy_rng  = 102
+
+[cost_stress]
+multipliers = [1, 2, 3]
