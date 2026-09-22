@@ -297,11 +297,58 @@ class BarExecutionModel:
         # actually actionable.
         partial = filled_token_ui < desired_token_ui - 1e-12
 
+        if partial and side is Side.SELL:
+            # ...but that rationale is an entry-side argument, and it does not
+            # survive contact with contracts §6 ("SELL quantity == quoted
+            # quantity, exactly", enforced on the settled Fill by
+            # invariants.check_sell_quantity_matches_quote). A partially filled
+            # SELL under-delivers against the quote it was bound to and
+            # breaches that invariant outright — the same reasoning the
+            # cap-exhausted branch above already applies, just at a non-zero
+            # size.
+            #
+            # It also cascades, which is how this surfaced: an exit that leaves
+            # a sliver of the position behind re-triggers the same stop on the
+            # next decision tick, which sells the same fraction of the
+            # remainder, and one thin bar becomes a chain of ever-smaller dust
+            # trades that never fully closes the position.
+            #
+            # Rejecting is the conservative reading a screening model owes an
+            # exit: record that the position could not be got out inside the
+            # bar's own traded volume, rather than record an exit that did not
+            # happen at the size it claims.
+            return ExecutionReport(
+                report_id=new_fill_id(),
+                intent_id=intent.intent_id,
+                order_id=None,
+                state=OrderState.FAILED,
+                ts=now,
+                fidelity=FidelityTier.TIER_0,
+                fill=None,
+                costs=None,
+                reason=(
+                    f"participation cap binds a SELL (bar volume={next_bar.volume}, "
+                    f"wanted {desired_token_ui}, cap {cap_token_ui}); an exit must "
+                    f"fill its quoted quantity exactly or not at all; "
+                    f"{NON_EXECUTABLE_NOTICE}"
+                ),
+            )
+
         if side is Side.BUY:
             fill_in_atomic = input_token.to_atomic(filled_token_ui * entry_price)
             fill_out_atomic = output_token.to_atomic(filled_token_ui)
         else:
-            fill_in_atomic = input_token.to_atomic(filled_token_ui)
+            # The exact intent integer, deliberately not the float round-trip
+            # ``input_token.to_atomic(filled_token_ui)``. A SELL reaching here
+            # is never partial (the branch above rejects those), so
+            # ``filled_token_ui`` is exactly ``to_ui(intent.in_amount_atomic)``
+            # and the only thing re-deriving it can do is lose an atomic unit
+            # to float rounding — which it does, and which
+            # ``check_sell_quantity_matches_quote`` then reports as a 1-unit
+            # breach against a quote that priced the intent's own integer.
+            # Contracts §0 keeps token amounts as ``int`` atomic precisely so
+            # this leg never has to survive a round trip through a float.
+            fill_in_atomic = intent.in_amount_atomic
             fill_out_atomic = output_token.to_atomic(filled_token_ui * entry_price)
 
         token_amount_atomic = fill_out_atomic if side is Side.BUY else fill_in_atomic

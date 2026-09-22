@@ -13,10 +13,13 @@ label = "baseline_price_volume"
 run_id_prefix = "baseline_pv"
 
 [date_range]
-# Epoch seconds.  These bracket the full 209-day 1h history available at
-# TIER_0.  Adjust when a longer data pull has been completed.
-start_ts = 1_717_200_000  # 2024-06-01 00:00 UTC
-end_ts   = 1_735_084_800  # 2024-12-25 00:00 UTC
+# Epoch seconds, derived from history/manifest.json rather than chosen: these
+# bracket every bar in the backfill (earliest open 2026-02-03 15:00, latest
+# open 2026-09-21 06:20, plus one 1h interval and the 60s publication delay so
+# the final bar is still available inside the window).  Adjust when a longer
+# data pull has been completed.
+start_ts = 1_770_130_800  # 2026-02-03 15:00 UTC
+end_ts   = 1_789_977_600  # 2026-09-21 08:00 UTC
 
 [data]
 universe_version = "v1"

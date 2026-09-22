@@ -47,14 +47,14 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from memetrader import ids
 from memetrader.backtest import invariants
 from memetrader.backtest.broker import BrokerAttempt, SimulatedBroker
 from memetrader.backtest.clock import SimulatedClock
 from memetrader.backtest.event_queue import EventQueue
-from memetrader.backtest.ledger import BacktestLedger
+from memetrader.backtest.ledger import MICRO, BacktestLedger
 from memetrader.execution.interfaces import ApprovedOrder
 from memetrader.histdata.point_in_time import ReplayState
 from memetrader.histdata.schemas import CandleRecord, PoolState
@@ -659,7 +659,30 @@ class ReplayEngine:
             # asserts no position moved, only cash/gas.
             invariants.check_execution_failure_no_position_change(self.ledger, report)
         else:
+            # Bracket the apply so this fill's own realised PnL can be stamped
+            # onto it below: the ledger books realised PnL against FIFO lots
+            # and only exposes the running total, so the delta across the call
+            # *is* this fill's contribution. ``apply_fill`` returns a bool, not
+            # an amount, and widening that signature would touch every caller.
+            realized_before = self.ledger.realized_pnl_micro_usd
             self.ledger.apply_fill(report, mint=mint)
+            realized_delta = self.ledger.realized_pnl_micro_usd - realized_before
+            if report.fill is not None and realized_delta != 0:
+                # Mirrors the live broker (broker.py's ``realized_pnl_usd=
+                # realized_micro / _MICRO``), which the replay otherwise
+                # silently diverges from: ``Fill.realized_pnl_usd`` defaults to
+                # 0.0, and nothing on the backtest path ever set it. Every
+                # trade-level metric reads it —
+                # ``metrics.performance`` counts a closed trade only when a
+                # SELL fill's ``realized_pnl_usd != 0.0`` — so leaving it at
+                # the default reports ``trade_count=0``, and a null hit rate,
+                # profit factor and expectancy, for a run that demonstrably
+                # traded. Worse than missing: a backtest that turned over 15%
+                # of the book while claiming it made no trades.
+                report = replace(
+                    report,
+                    fill=replace(report.fill, realized_pnl_usd=realized_delta / MICRO),
+                )
 
         if report.fill is not None:
             invariants.check_sell_quantity_matches_quote(report.fill, approved.quote)

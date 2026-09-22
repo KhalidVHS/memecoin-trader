@@ -276,8 +276,16 @@ def _pool_state_events(
     ``_universe_events``, which this mirrors) rather than emitted throughout
     the replay: this is a single static observation, not a fabricated
     historical liquidity series.
+
+    Sorted by ``asset_id`` because every one of these events shares the same
+    ``available_time``, kind, sequence and source — so ``HistoricalEvent.sort_key``
+    falls all the way through to ``asset_id`` as its only tiebreaker, and
+    ``EventQueue`` rejects a stream whose ``sort_key`` ever decreases. The
+    universe file is ordered for human readability, not by mint, so iterating
+    ``universe.entries`` directly raises ``EventQueueError`` on any universe
+    whose entries happen not to be alphabetical by mint.
     """
-    for entry in universe.entries:
+    for entry in sorted(universe.entries, key=lambda e: e.asset_id):
         if entry.liquidity_usd is not None:
             yield _pool_state_event(entry, available_time=start_ts)
 

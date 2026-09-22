@@ -62,6 +62,7 @@ from __future__ import annotations
 import datetime as _datetime_module
 import hashlib
 import math
+import sys
 import time
 import types as _types
 from typing import NoReturn
@@ -123,7 +124,37 @@ def active_clock() -> SimulatedClock | None:
     return _active_clock
 
 
+def _called_from_logging() -> bool:
+    """Whether the immediate caller of a guard is the stdlib ``logging`` module.
+
+    ``logging.LogRecord.__init__`` timestamps every record with
+    ``time.time_ns()``. Without this exemption the guard turns any
+    ``logger.warning(...)`` reached during a replay into a crashed run — and
+    the replay's own production code legitimately warns (``portfolio
+    .stop_loss_breaches`` on an unmarkable position, for one).
+
+    Exempting it is sound for the same reason ``time.monotonic`` is not
+    guarded at all: a log record's ``created`` timestamp is observability
+    metadata that is written out and never read back into the simulation, so
+    it cannot make the economic output differ between two runs over identical
+    data. What the guard exists to catch — replay *logic* branching on the
+    real time of day — is untouched, because that logic is not the ``logging``
+    module.
+
+    Identified by the calling frame's module name rather than by comparing
+    code objects, so it keeps working across CPython versions that move the
+    ``time_ns()`` call between ``LogRecord.__init__`` and its callers. The
+    narrow cost is that a third-party module literally named ``logging`` would
+    also be exempt; nothing in this codebase shadows that name.
+    """
+    frame = sys._getframe(2)  # 0 = here, 1 = the guard, 2 = whoever called it
+    module = frame.f_globals.get("__name__", "")
+    return module == "logging" or module.startswith("logging.")
+
+
 def _guarded_time() -> float:
+    if _called_from_logging():
+        return _orig_time_time()
     raise WallClockAccessError(
         "time.time() called during a replay — read the SimulatedClock instead. "
         "A wall-clock read makes the replay non-deterministic: two runs over "
@@ -133,6 +164,8 @@ def _guarded_time() -> float:
 
 
 def _guarded_time_ns() -> int:
+    if _called_from_logging():
+        return _orig_time_time_ns()
     raise WallClockAccessError(
         "time.time_ns() called during a replay — read the SimulatedClock instead. "
         "See time.time() guard for the rationale."

@@ -18,8 +18,11 @@ label = "execution_stress"
 run_id_prefix = "exec_stress"
 
 [date_range]
-start_ts = 1_717_200_000  # 2024-06-01 00:00 UTC
-end_ts   = 1_735_084_800  # 2024-12-25 00:00 UTC
+# Brackets every bar in history/manifest.json — see baseline_price_volume.toml
+# for the derivation.  Kept identical across the starter configs so a stress
+# run and its baseline cover the same record.
+start_ts = 1_770_130_800  # 2026-02-03 15:00 UTC
+end_ts   = 1_789_977_600  # 2026-09-21 08:00 UTC
 
 [data]
 universe_version = "v1"
