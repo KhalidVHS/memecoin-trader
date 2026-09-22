@@ -69,7 +69,6 @@ from memetrader.types import (
 )
 
 from .constant_product import amount_out as cp_amount_out
-from .constant_product import price_impact_pct as cp_price_impact_pct
 
 __all__ = [
     "Hop",

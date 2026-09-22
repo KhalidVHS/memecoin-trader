@@ -4,7 +4,7 @@ Every test is offline and deterministic. Fixtures use the same helpers as
 test_splits.py (copied inline to avoid a cross-test-file import dependency).
 
 Critical tests:
-- test_test_read_exactly_once        — TestAccessViolation on second read
+- test_test_read_exactly_once        — EvaluationAccessViolation on second read
 - test_leakage_clean_after_run       — assert_leakage_clean passes after valid run
 - test_zero_test_reads_caught        — access_count == 0 would fail leakage check
 - test_phases_called_in_order        — fit before select before refit before test
@@ -26,11 +26,11 @@ from memetrader.validation.splits import (
     PurgedWalkForward,
 )
 from memetrader.validation.walk_forward import (
+    EvaluationAccessViolation,
     FoldResult,
-    TestAccessViolation,
     WalkForwardError,
-    WalkForwardRunResult,
     WalkForwardRunner,
+    WalkForwardRunResult,
     _GuardedTestView,
 )
 
@@ -102,22 +102,20 @@ def _make_runner(
     ``skip_test_read``: test_fn never reads the test view (skipped evaluation probe).
     """
 
-    def fit_fn(
-        train_obs: list[LabeledObservation], fold: FoldRecord
-    ) -> dict[str, Any]:
+    def fit_fn(train_obs: list[LabeledObservation], fold: FoldRecord) -> dict[str, Any]:
         call_log.events.append("fit")
         call_log.fit_n_train.append(len(train_obs))
         return {"phase": "fit", "n": len(train_obs)}
 
     def select_fn(
-        fitted: Any, val_obs: list[LabeledObservation], fold: FoldRecord
+        fitted_model: Any, val_obs: list[LabeledObservation], fold: FoldRecord
     ) -> dict[str, Any]:
         call_log.events.append("select")
         call_log.select_n_val.append(len(val_obs))
         return {"phase": "select", "threshold": 0.5}
 
     def refit_fn(
-        config: Any, train_val_obs: list[LabeledObservation], fold: FoldRecord
+        selected_config: Any, train_val_obs: list[LabeledObservation], fold: FoldRecord
     ) -> dict[str, Any]:
         call_log.events.append("refit")
         call_log.refit_n_train_val.append(len(train_val_obs))
@@ -126,7 +124,7 @@ def _make_runner(
     if double_read_test:
 
         def test_fn(
-            model: Any, test_view: _GuardedTestView, fold: FoldRecord
+            refitted_model: Any, test_view: _GuardedTestView, fold: FoldRecord
         ) -> dict[str, Any]:
             call_log.events.append("test")
             obs = test_view.read()  # first read
@@ -136,8 +134,8 @@ def _make_runner(
 
     elif skip_test_read:
 
-        def test_fn(  # type: ignore[misc]
-            model: Any, test_view: _GuardedTestView, fold: FoldRecord
+        def test_fn(
+            refitted_model: Any, test_view: _GuardedTestView, fold: FoldRecord
         ) -> dict[str, Any]:
             call_log.events.append("test")
             # Deliberately does not call test_view.read().
@@ -145,8 +143,8 @@ def _make_runner(
 
     else:
 
-        def test_fn(  # type: ignore[misc]
-            model: Any, test_view: _GuardedTestView, fold: FoldRecord
+        def test_fn(
+            refitted_model: Any, test_view: _GuardedTestView, fold: FoldRecord
         ) -> dict[str, Any]:
             call_log.events.append("test")
             obs = test_view.read()
@@ -187,10 +185,10 @@ class TestGuardedTestView:
         assert view.access_count == 1
 
     def test_second_read_raises(self) -> None:
-        """GUARD TEST: second read must raise TestAccessViolation."""
+        """GUARD TEST: second read must raise EvaluationAccessViolation."""
         view = self._make_view(5)
         view.read()
-        with pytest.raises(TestAccessViolation, match="already read"):
+        with pytest.raises(EvaluationAccessViolation, match="already read"):
             view.read()
 
     def test_access_count_increments(self) -> None:
@@ -202,7 +200,7 @@ class TestGuardedTestView:
     def test_fold_id_in_error_message(self) -> None:
         view = _GuardedTestView(_observations=[], _fold_id="my_fold_007")
         view.read()
-        with pytest.raises(TestAccessViolation, match="my_fold_007"):
+        with pytest.raises(EvaluationAccessViolation, match="my_fold_007"):
             view.read()
 
 
@@ -269,7 +267,7 @@ class TestWalkForwardRunnerNormal:
             runner.run(obs, data_start=data_start, data_end=data_end)
 
         for n_fit, n_refit, n_val in zip(
-            log.fit_n_train, log.refit_n_train_val, log.select_n_val
+            log.fit_n_train, log.refit_n_train_val, log.select_n_val, strict=True
         ):
             assert n_refit >= n_fit, (
                 f"refit saw {n_refit} obs but fit saw {n_fit}; refit must see ≥ fit"
@@ -310,7 +308,7 @@ class TestWalkForwardRunnerNormal:
             result = runner.run(obs, data_start=data_start, data_end=data_end)
 
         assert len(result.fold_records) == len(result.fold_results)
-        for fr, rec in zip(result.fold_results, result.fold_records):
+        for fr, rec in zip(result.fold_results, result.fold_records, strict=True):
             assert fr.fold.fold_id == rec.fold_id
 
 
@@ -327,7 +325,7 @@ class TestLeakageDetection:
         return obs, data_start, data_end
 
     def test_double_read_raises_during_run(self) -> None:
-        """GUARD TEST: test_fn that reads test twice must raise TestAccessViolation.
+        """GUARD TEST: test_fn that reads test twice must raise EvaluationAccessViolation.
 
         This tests the structural invariant: the runner raises immediately
         when test_fn accesses the test view more than once, so a leakage event
@@ -338,7 +336,7 @@ class TestLeakageDetection:
         runner = _make_runner(log, double_read_test=True)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            with pytest.raises(TestAccessViolation):
+            with pytest.raises(EvaluationAccessViolation):
                 runner.run(obs, data_start=data_start, data_end=data_end)
 
     def test_skip_test_read_caught_by_walk_forward_error(self) -> None:

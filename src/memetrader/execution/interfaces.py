@@ -36,7 +36,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from ..types import (
+from memetrader.types import (
     ExecutionReport,
     FidelityTier,
     HistoricalEvent,
@@ -53,7 +53,7 @@ if TYPE_CHECKING:
     # guard lets mypy resolve the annotation while keeping the runtime import-free.
     # If the module does not exist yet during concurrent development, this file
     # still imports cleanly.
-    from ..histdata.point_in_time import PointInTimeState
+    from memetrader.histdata.point_in_time import PointInTimeState
 
 
 class NoRoute(Exception):
@@ -109,7 +109,7 @@ class ApprovedOrder:
         # decision that could fill at the close — which is exactly the look-ahead
         # the latency model is designed to prevent.
         if self.decided_at < 0:
-            from ..types import ValidationError
+            from memetrader.types import ValidationError
 
             raise ValidationError(f"decided_at {self.decided_at} is negative")
 

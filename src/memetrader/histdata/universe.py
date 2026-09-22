@@ -47,7 +47,6 @@ import datetime
 from dataclasses import dataclass
 from pathlib import Path
 
-
 # Default minimum pool age before a coin enters the universe. Chosen so that
 # a coin has at least some price history before we expect feature pipelines to
 # compute meaningful signals. 14 days is enough for a 1h RSI(14) to warm up.
@@ -104,9 +103,7 @@ class UniverseEntry:
         """
         if ts < self.eligible_from:
             return False
-        if self.removed_at is not None and ts >= self.removed_at:
-            return False
-        return True
+        return self.removed_at is None or ts < self.removed_at
 
 
 @dataclass
@@ -178,7 +175,7 @@ class UniverseCatalog:
                 try:
                     pool_created_dt = datetime.datetime.strptime(
                         pool_created_str, "%Y-%m-%d"
-                    ).replace(tzinfo=datetime.timezone.utc)
+                    ).replace(tzinfo=datetime.UTC)
                     pool_created_at = pool_created_dt.timestamp()
                 except ValueError:
                     pool_created_at = 0.0
@@ -292,9 +289,7 @@ class UniverseCatalog:
             return float("inf")  # at least one coin is still active
         return max(ends)
 
-    def with_entry_removed_at(
-        self, asset_id: str, removed_at: float
-    ) -> UniverseCatalog:
+    def with_entry_removed_at(self, asset_id: str, removed_at: float) -> UniverseCatalog:
         """Return a copy with one entry's ``removed_at`` set.
 
         Used in survivorship tests: we can build a universe that looks like

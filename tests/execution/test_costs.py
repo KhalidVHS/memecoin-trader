@@ -17,9 +17,8 @@ from __future__ import annotations
 import pytest
 
 from memetrader.config import ExecutionConfig
-from memetrader.execution.costs import StressLevel, apply_stress, build_cost_breakdown
+from memetrader.execution.costs import CostBreakdown, apply_stress, build_cost_breakdown
 from memetrader.types import OrderState, Side
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -162,7 +161,7 @@ class TestGasOnFailedAttempts:
 
 
 class TestStressMultiplier:
-    def _baseline_costs(self) -> object:
+    def _baseline_costs(self) -> CostBreakdown:
         fill = _make_fill(pool_fee_usd=0.25)
         return build_cost_breakdown(fill, _EXEC_CFG, quote_replayed=False)
 

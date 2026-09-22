@@ -37,23 +37,17 @@ comparable — the promotion gate can read off the same fields from both.
 
 from __future__ import annotations
 
-import math
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Sequence
 
 import numpy as np
 
-from memetrader.types import FidelityTier, Fill, NON_EXECUTABLE_NOTICE, OrderState, Side
 from memetrader.metrics.performance import (
     PerformanceMetrics,
-    compute_performance,
     _period_returns,
-    _sharpe,
-    max_drawdown,
-    _total_return_pct,
-    _annualized_return,
+    compute_performance,
 )
-
+from memetrader.types import FidelityTier, Fill, OrderState, Side
 
 # ---------------------------------------------------------------------------
 # Output type
@@ -173,8 +167,9 @@ def random_entry_benchmark(
     if n < 2:
         return BenchmarkResult(
             name="random_entry",
-            metrics=_make_metrics(arr or [1000.0], periods_per_year=periods_per_year,
-                                  fidelity=fidelity),
+            metrics=_make_metrics(
+                arr or [1000.0], periods_per_year=periods_per_year, fidelity=fidelity
+            ),
             seed=seed,
         )
 
@@ -184,17 +179,24 @@ def random_entry_benchmark(
 
     # We need timestamps to map to equity indices.  We use fill timestamps
     # and approximate equity indices by linear interpolation over time.
-    times = [float(e) for e in equity]  # equity is just floats (NAV), no timestamps
     # Since equity doesn't carry timestamps, we approximate holding periods
     # by using sorted fill order to estimate bar positions.
     landed = [f for f in fills if f.state is OrderState.LANDED]
     landed_sorted = sorted(landed, key=lambda f: f.ts)
 
     if not landed_sorted:
-        # No trades — simulate constant equity
+        # No trades — simulate constant equity at the starting value, exactly
+        # like cash_benchmark. (Previously this returned `arr` unchanged,
+        # i.e. the *strategy's own* equity curve rather than a flat one —
+        # a strategy with no trades but drifting equity would have been
+        # compared against itself and always "beat" a null that was never
+        # actually flat. Fixed to match the comment's stated intent.)
+        flat = [arr[0]] * n if arr else [1000.0]
         return BenchmarkResult(
             name="random_entry",
-            metrics=_make_metrics(arr, periods_per_year=periods_per_year, fidelity=fidelity),
+            metrics=_make_metrics(
+                flat, periods_per_year=periods_per_year, fidelity=fidelity
+            ),
             seed=seed,
         )
 
@@ -218,9 +220,15 @@ def random_entry_benchmark(
             trips.append((hold, notional))
 
     if not trips:
+        # No round-trips could be reconstructed (e.g. only BUYs, no SELLs):
+        # same fix as above — flat at the starting value, not the strategy's
+        # own curve.
+        flat_no_trips = [arr[0]] * n
         return BenchmarkResult(
             name="random_entry",
-            metrics=_make_metrics(arr, periods_per_year=periods_per_year, fidelity=fidelity),
+            metrics=_make_metrics(
+                flat_no_trips, periods_per_year=periods_per_year, fidelity=fidelity
+            ),
             seed=seed,
         )
 
@@ -248,8 +256,9 @@ def random_entry_benchmark(
 
     return BenchmarkResult(
         name="random_entry",
-        metrics=_make_metrics(rep_equity, periods_per_year=periods_per_year,
-                              fidelity=fidelity),
+        metrics=_make_metrics(
+            rep_equity, periods_per_year=periods_per_year, fidelity=fidelity
+        ),
         seed=seed,
     )
 
@@ -290,15 +299,19 @@ def random_asset_benchmark(
     landed = [f for f in fills if f.state is OrderState.LANDED and f.side is Side.SELL]
 
     if not landed or n < 2:
+        # No SELLs to randomize: same fix as random_entry_benchmark — a null
+        # with nothing to simulate must be flat at the starting value, not
+        # the strategy's own (possibly drifting) equity curve.
+        flat = [arr[0]] * n if arr else [1000.0]
         return BenchmarkResult(
             name="random_asset",
-            metrics=_make_metrics(arr or [1000.0], periods_per_year=periods_per_year,
-                                  fidelity=fidelity),
+            metrics=_make_metrics(
+                flat, periods_per_year=periods_per_year, fidelity=fidelity
+            ),
             seed=seed,
         )
 
     # Use aggregate equity return per bar as the random-asset return proxy
-    eq_arr = np.array(arr, dtype=np.float64)
     rets = _period_returns(arr)
 
     starting = arr[0]
@@ -319,8 +332,9 @@ def random_asset_benchmark(
 
     return BenchmarkResult(
         name="random_asset",
-        metrics=_make_metrics(rep_equity, periods_per_year=periods_per_year,
-                              fidelity=fidelity),
+        metrics=_make_metrics(
+            rep_equity, periods_per_year=periods_per_year, fidelity=fidelity
+        ),
         seed=seed,
     )
 
@@ -354,8 +368,9 @@ def equal_weight_basket_benchmark(
         flat = [starting_capital]
         return BenchmarkResult(
             name="equal_weight_basket",
-            metrics=_make_metrics(flat, periods_per_year=periods_per_year,
-                                  fidelity=fidelity),
+            metrics=_make_metrics(
+                flat, periods_per_year=periods_per_year, fidelity=fidelity
+            ),
             seed=None,
         )
 
@@ -364,8 +379,9 @@ def equal_weight_basket_benchmark(
     if min_len < 2:
         return BenchmarkResult(
             name="equal_weight_basket",
-            metrics=_make_metrics([starting_capital], periods_per_year=periods_per_year,
-                                  fidelity=fidelity),
+            metrics=_make_metrics(
+                [starting_capital], periods_per_year=periods_per_year, fidelity=fidelity
+            ),
             seed=None,
         )
 
@@ -382,8 +398,9 @@ def equal_weight_basket_benchmark(
 
     return BenchmarkResult(
         name="equal_weight_basket",
-        metrics=_make_metrics(basket_equity, periods_per_year=periods_per_year,
-                              fidelity=fidelity),
+        metrics=_make_metrics(
+            basket_equity, periods_per_year=periods_per_year, fidelity=fidelity
+        ),
         seed=None,
     )
 
@@ -415,8 +432,9 @@ def buy_hold_sol_benchmark(
     if not prices or prices[0] <= 0.0:
         return BenchmarkResult(
             name="buy_hold_sol",
-            metrics=_make_metrics([starting_capital], periods_per_year=periods_per_year,
-                                  fidelity=fidelity),
+            metrics=_make_metrics(
+                [starting_capital], periods_per_year=periods_per_year, fidelity=fidelity
+            ),
             seed=None,
         )
 
@@ -425,7 +443,6 @@ def buy_hold_sol_benchmark(
 
     return BenchmarkResult(
         name="buy_hold_sol",
-        metrics=_make_metrics(equity, periods_per_year=periods_per_year,
-                              fidelity=fidelity),
+        metrics=_make_metrics(equity, periods_per_year=periods_per_year, fidelity=fidelity),
         seed=None,
     )

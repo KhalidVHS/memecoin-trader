@@ -111,8 +111,7 @@ def mention_velocity_24h(
     available_time = getattr(record, "available_time", None)
     if available_time is None or float(available_time) > now:
         return None, (
-            f"record available_time {available_time} > now {now}: "
-            "point-in-time violation"
+            f"record available_time {available_time} > now {now}: point-in-time violation"
         )
 
     value = getattr(record, "mention_velocity_24h", None)
@@ -150,8 +149,7 @@ def mention_zscore_7d(
     available_time = getattr(record, "available_time", None)
     if available_time is None or float(available_time) > now:
         return None, (
-            f"record available_time {available_time} > now {now}: "
-            "point-in-time violation"
+            f"record available_time {available_time} > now {now}: point-in-time violation"
         )
 
     value = getattr(record, "mention_zscore_7d", None)
@@ -186,14 +184,16 @@ def unique_contributors_24h(
     available_time = getattr(record, "available_time", None)
     if available_time is None or float(available_time) > now:
         return None, (
-            f"record available_time {available_time} > now {now}: "
-            "point-in-time violation"
+            f"record available_time {available_time} > now {now}: point-in-time violation"
         )
 
     value = getattr(record, "unique_contributors_24h", None)
     if value is None:
         return None, "unique_contributors_24h is None on the record"
-    count = int(value)
+    v = float(value)
+    if not math.isfinite(v):
+        return None, "unique_contributors_24h is non-finite"
+    count = int(v)
     return float(count), ""
 
 
@@ -218,8 +218,7 @@ def contributor_to_post_ratio(
     available_time = getattr(record, "available_time", None)
     if available_time is None or float(available_time) > now:
         return None, (
-            f"record available_time {available_time} > now {now}: "
-            "point-in-time violation"
+            f"record available_time {available_time} > now {now}: point-in-time violation"
         )
 
     value = getattr(record, "contributor_to_post_ratio", None)

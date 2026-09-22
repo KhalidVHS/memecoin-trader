@@ -57,7 +57,9 @@ def make_gapped_close_ts(
     close, _ = make_close_ts(n_before + n_after, seed=seed)
     ts_before = np.arange(n_before, dtype=float) * INTERVAL + START_TS
     ts_after = (
-        ts_before[-1] + gap_multiple * INTERVAL + INTERVAL
+        ts_before[-1]
+        + gap_multiple * INTERVAL
+        + INTERVAL
         + np.arange(n_after, dtype=float) * INTERVAL
     )
     ts = np.concatenate([ts_before, ts_after])
@@ -101,9 +103,7 @@ def test_rvol_matches_signals_across_many_windows() -> None:
             assert actual is None
         else:
             assert actual is not None
-            assert abs(actual - expected) < 1e-12, (
-                f"seed={seed}: {actual} != {expected}"
-            )
+            assert abs(actual - expected) < 1e-12, f"seed={seed}: {actual} != {expected}"
 
 
 def test_rvol_none_on_insufficient_bars() -> None:
@@ -277,7 +277,7 @@ def test_sector_return_excludes_asset() -> None:
     Guard: including a coin in its own sector index overstates the sector's
     explanatory power for that coin in residual momentum.
     """
-    returns = {"A": 10.0, "B": 2.0, "C": 3.0}
+    returns: dict[str, float | None] = {"A": 10.0, "B": 2.0, "C": 3.0}
     # Excluding A: mean of {B: 2.0, C: 3.0} = 2.5
     result = sector_return(returns, exclude_asset="A")
     assert result is not None

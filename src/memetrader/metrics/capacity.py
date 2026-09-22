@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 
-from memetrader.types import FidelityTier, Mark, NON_EXECUTABLE_NOTICE, finite
+from memetrader.types import NON_EXECUTABLE_NOTICE, FidelityTier, Mark
 
 
 @dataclass
@@ -13,23 +13,23 @@ class PositionCapacity:
 
     symbol: str
     quantity_ui: float
-    reference_mark_usd: float          # mid * quantity — may overstate
+    reference_mark_usd: float  # mid * quantity — may overstate
     executable_liquidation_usd: float  # size-specific, conservative
-    mark_basis: str                    # from Mark.basis
+    mark_basis: str  # from Mark.basis
     is_executable_mark: bool
     estimated_price_impact_pct: float  # at current size
-    capacity_at_1pct_impact_usd: float # size at which impact = 1%
-    haircut_pct: float                 # applied to get executable value
-    warning: str | None                # set when mark is non-executable
+    capacity_at_1pct_impact_usd: float  # size at which impact = 1%
+    haircut_pct: float  # applied to get executable value
+    warning: str | None  # set when mark is non-executable
 
 
 @dataclass
 class CapacityReport:
     positions: list[PositionCapacity]
-    strategy_capacity_usd: float        # min(capacity_at_1pct_impact) across positions
+    strategy_capacity_usd: float  # min(capacity_at_1pct_impact) across positions
     total_reference_mark_usd: float
     total_executable_liquidation_usd: float
-    exceeds_intended_size: bool         # capacity > intended_live_position_usd
+    exceeds_intended_size: bool  # capacity > intended_live_position_usd
     intended_live_position_usd: float | None
     fidelity: FidelityTier
     non_executable_notice: str | None
@@ -45,8 +45,8 @@ def _compute_impact_pct(
     if adv_usd is not None and reference_mark_usd > 0 and adv_usd > 0:
         if price_impact_model == "sqrt":
             return k * math.sqrt(reference_mark_usd / adv_usd) * 100.0
-        else:  # linear
-            return (reference_mark_usd / adv_usd) * 100.0
+        # linear
+        return (reference_mark_usd / adv_usd) * 100.0
     return 10.0  # fixed conservative haircut when no volume data
 
 
@@ -63,10 +63,10 @@ def _compute_capacity_at_1pct(
         # sqrt(size / adv) = 0.01 / k
         # size = adv * (0.01 / k)^2
         return adv_usd * (0.01 / k) ** 2
-    else:  # linear
-        # impact_pct = (size / adv) * 100 = 1
-        # size = adv * 0.01
-        return adv_usd * 0.01
+    # linear
+    # impact_pct = (size / adv) * 100 = 1
+    # size = adv * 0.01
+    return adv_usd * 0.01
 
 
 def liquidation_value(

@@ -43,8 +43,7 @@ import math
 
 import numpy as np
 
-from ..signals import REALIZED_VOL_PERIOD
-
+from memetrader.signals import REALIZED_VOL_PERIOD
 
 # ---------------------------------------------------------------------------
 # Gap detection helpers
@@ -76,9 +75,7 @@ def _gaps_exceed_threshold(
     return bool(np.any(gaps > max_gap_multiple * interval_seconds))
 
 
-def _missing_fraction(
-    timestamps: np.ndarray, interval_seconds: float
-) -> float | None:
+def _missing_fraction(timestamps: np.ndarray, interval_seconds: float) -> float | None:
     """Fraction of expected bars that are absent in the timestamp sequence.
 
     Requires at least two timestamps to estimate expected bar count. Returns

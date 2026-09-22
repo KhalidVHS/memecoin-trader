@@ -37,8 +37,7 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 
-from .registry import FeatureDefinition, FeatureRegistry
-
+from .registry import FeatureRegistry
 
 # ---------------------------------------------------------------------------
 # PointInTimeState protocol — reproduced here so this module compiles without
@@ -66,9 +65,7 @@ class PointInTimeState(Protocol):
         """Current simulated time, epoch seconds."""
         ...
 
-    def bars(
-        self, asset_id: str, timeframe: str, *, lookback: int
-    ) -> tuple[object, ...]:
+    def bars(self, asset_id: str, timeframe: str, *, lookback: int) -> tuple[object, ...]:
         """Up to ``lookback`` closed candles for ``asset_id`` on ``timeframe``.
 
         Returns an empty tuple when there is no history, never raises on
@@ -205,7 +202,7 @@ class FeatureResult:
     "TIER_0: no quote ladder" are useful for debugging feature availability.
     """
 
-    __slots__ = ("asset_id", "ts", "values", "reasons")
+    __slots__ = ("asset_id", "reasons", "ts", "values")
 
     def __init__(self, asset_id: str, ts: float) -> None:
         self.asset_id = asset_id

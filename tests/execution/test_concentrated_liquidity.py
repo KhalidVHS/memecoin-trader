@@ -21,12 +21,11 @@ the tests focus on invariants that hold regardless of the internal mechanics:
 from __future__ import annotations
 
 import pytest
-from hypothesis import assume, given, settings
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from memetrader.execution.amm.concentrated_liquidity import (
     LiquidityRange,
-    SwapResult,
     sqrt_price_at_tick,
     swap,
     tick_at_sqrt_price,

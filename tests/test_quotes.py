@@ -50,6 +50,7 @@ from __future__ import annotations
 import dataclasses
 import json
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -72,7 +73,13 @@ BUY_IN_ATOMIC = 100_000_000
 SELL_IN_ATOMIC = 3_396_739_130_434
 
 
-def load_fixture(name: str) -> dict | list:
+def load_fixture(name: str) -> dict[str, Any]:
+    return json.loads((FIXTURES / name).read_text())
+
+
+def load_list_fixture(name: str) -> list[dict[str, Any]]:
+    """For the fixtures that are themselves a JSON array (``/tokens/v2/search``
+    responses), as opposed to the quote fixtures, which are one JSON object."""
     return json.loads((FIXTURES / name).read_text())
 
 
@@ -100,7 +107,7 @@ def make_client(
 ) -> httpx.Client:
     buy = load_fixture("jupiter_quote_buy.json")
     sell = load_fixture("jupiter_quote_sell.json")
-    token_info = load_fixture("jupiter_token_info.json")
+    token_info = load_list_fixture("jupiter_token_info.json")
 
     def handler(request: httpx.Request) -> httpx.Response:
         if seen is not None:
@@ -502,7 +509,7 @@ def test_unverified_decimals_cannot_reach_an_executable_quote(cfg) -> None:
 
 
 def test_absurd_decimals_from_the_vendor_are_refused(cfg) -> None:
-    info = load_fixture("jupiter_token_info.json")
+    info = load_list_fixture("jupiter_token_info.json")
     broken = [
         dict(entry, decimals=42) if entry["id"] == BONK_MINT else entry for entry in info
     ]

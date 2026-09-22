@@ -47,6 +47,7 @@ import json
 import tomllib
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 from memetrader.types import ExecutionMode, FidelityTier
 
@@ -160,9 +161,7 @@ class FoldParams:
                 raise BacktestConfigError(f"folds.{name} must be finite, got {v}")
             if v < 0:
                 raise BacktestConfigError(f"folds.{name} must be >= 0, got {v}")
-        if not isinstance(self.n_outer_folds, int) or isinstance(
-            self.n_outer_folds, bool
-        ):
+        if not isinstance(self.n_outer_folds, int) or isinstance(self.n_outer_folds, bool):
             raise BacktestConfigError("folds.n_outer_folds must be an int")
         if self.n_outer_folds < 1:
             raise BacktestConfigError(
@@ -348,9 +347,7 @@ class BacktestConfig:
                 f"fast_tick_seconds {self.fast_tick_seconds} below minimum 5"
             )
         if self.decision_tick_seconds < self.fast_tick_seconds:
-            raise BacktestConfigError(
-                "decision_tick_seconds must be >= fast_tick_seconds"
-            )
+            raise BacktestConfigError("decision_tick_seconds must be >= fast_tick_seconds")
         if self.decision_tick_seconds % self.fast_tick_seconds != 0:
             raise BacktestConfigError(
                 f"decision_tick_seconds {self.decision_tick_seconds} must be a "
@@ -394,28 +391,33 @@ def load(path: Path) -> BacktestConfig:
         raise BacktestConfigError(f"backtest config not found: {path}")
 
     with path.open("rb") as fh:
-        raw = tomllib.load(fh)
+        try:
+            raw = tomllib.load(fh)
+        except tomllib.TOMLDecodeError as exc:
+            raise BacktestConfigError(
+                f"backtest config {path} is not valid TOML: {exc}"
+            ) from exc
 
     try:
         cfg = _parse(raw)
     except (KeyError, TypeError, ValueError) as exc:
-        raise BacktestConfigError(
-            f"backtest config {path} is invalid: {exc}"
-        ) from exc
+        raise BacktestConfigError(f"backtest config {path} is invalid: {exc}") from exc
 
     cfg.validate()
     return cfg
 
 
-def _require(table: dict, key: str, section: str) -> object:
+# Returns ``Any``, not ``object``: TOML is dynamically typed, and every call
+# site immediately coerces the value it pulled (``str(...)``, ``float(...)``)
+# or hands it to a validator. Declaring ``object`` would make each of those
+# coercions a type error without making any of them safer.
+def _require(table: dict, key: str, section: str) -> Any:
     if key not in table:
-        raise BacktestConfigError(
-            f"backtest config is missing [{section}] {key!r}"
-        )
+        raise BacktestConfigError(f"backtest config is missing [{section}] {key!r}")
     return table[key]
 
 
-def _parse(raw: dict) -> BacktestConfig:  # noqa: PLR0912, PLR0914, PLR0915
+def _parse(raw: dict) -> BacktestConfig:
     """Convert a raw TOML dict to a ``BacktestConfig``.
 
     This function is intentionally explicit rather than generic.  A generic
@@ -576,7 +578,12 @@ def _config_to_canonical_dict(cfg: BacktestConfig) -> dict:
     ``json.dumps(sort_keys=True)`` always sorts.
     """
     raw = asdict(cfg)
-    return _normalise(raw)
+    # ``asdict`` on a dataclass always yields a dict, and ``_normalise`` maps a
+    # dict to a dict — but its signature is ``object -> object`` because it
+    # recurses through arbitrary values, so the narrowing has to be asserted.
+    normalised = _normalise(raw)
+    assert isinstance(normalised, dict)
+    return normalised
 
 
 def _normalise(obj: object) -> object:

@@ -43,7 +43,7 @@ import bisect
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
-from ..types import (
+from memetrader.types import (
     Candle,
     CandleSeries,
     DataQuality,
@@ -51,6 +51,7 @@ from ..types import (
     Side,
     Timeframe,
 )
+
 from .schemas import PoolState, QuoteLadder
 
 # Default publication delay for bar data. A candle closes at ``ts + interval``
@@ -270,7 +271,7 @@ class ReplayState:
         This method exists on the protocol so that TIER_1+ implementations
         can return a real snapshot without changing callers.
         """
-        return None
+        return
 
     def universe(self) -> frozenset[str]:
         """The tradable universe at ``self.now``.
@@ -365,9 +366,7 @@ class ReplayState:
         self._ladders[key].insert(idx, (ladder.available_time, ladder))
         self._ladder_times[key].insert(idx, ladder.available_time)
 
-    def set_universe(
-        self, members: frozenset[str], *, available_time: float
-    ) -> None:
+    def set_universe(self, members: frozenset[str], *, available_time: float) -> None:
         """Register a universe snapshot valid from ``available_time``.
 
         Multiple calls accumulate; the most recent snapshot at or before
@@ -407,7 +406,6 @@ class ReplayState:
         ``available_time`` is computed from the bar's ``ts``, the interval, and
         ``self.publication_delay_seconds``.
         """
-        from ..backfill import RawBar
         from .catalog import Catalog
 
         if not isinstance(catalog, Catalog):

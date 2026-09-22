@@ -15,8 +15,8 @@ None of these modules modify live code (``types.py``, ``quotes.py``,
 
 from __future__ import annotations
 
-from .constant_product import amount_in_for_out, amount_out, price_impact_pct, spot_price
 from .concentrated_liquidity import swap as clmm_swap
+from .constant_product import amount_in_for_out, amount_out, price_impact_pct, spot_price
 from .route_replay import RouteProvenance, RouteResult, replay_route
 
 __all__ = [

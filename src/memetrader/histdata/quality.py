@@ -34,11 +34,10 @@ meaningless. Wall-clock coverage is the honest metric.
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-from ..backfill import SeriesMeta, window_gaps
-from ..types import FidelityTier, Timeframe
+from memetrader.backfill import SeriesMeta, window_gaps
+from memetrader.types import FidelityTier, Timeframe
 
 # ------------------------------------------------------------------
 # Measured facts, hard-coded from docs/CANNOT-REPLAY.md.
@@ -50,7 +49,7 @@ from ..types import FidelityTier, Timeframe
 # Coins with fewer rows due to a shorter window (ACT, LOCKIN) are noted
 # in their entries. Coins not in this table have measured missing rates
 # between the values shown for the bracketed groups.
-MEASURED_5M_MISSING: dict[str, float] = {
+MEASURED_5M_MISSING: dict[str, float | None] = {
     "BONK": 0.5,
     "GIGA": 10.9,
     "CHILLGUY": 21.0,
@@ -74,7 +73,18 @@ MEASURED_5M_MISSING: dict[str, float] = {
     "BODEN": 81.0,
     "MOTHER": 81.0,
     "SLERF": 86.5,
-    "ACT": 0.0,  # 51-day window, but within that window low missing
+    # ACT is the one coin in the universe with NO measured 5m missing rate.
+    # CANNOT-REPLAY.md's 5m table lists 23 of the 24 coins and omits ACT
+    # entirely, because ACT's 5m series covers only 51 days (2026-08-01 →)
+    # against the ~209-day window every other figure here was measured over.
+    # There is no honest number to put in this slot, so it is None — §0:
+    # None means "could not find out", 0.0 would mean "measured, and it is
+    # perfect". A previous version had 0.0 here, which made a thinly-sampled
+    # 51-day coin read as the cleanest series in the universe and displaced
+    # BONK (0.5%, 209 days of dense trading) as the measured floor that
+    # BACKTEST-CONTRACTS.md §7 cites. Do not substitute an estimate: measure
+    # ACT's 5m series over a comparable window, or leave this None.
+    "ACT": None,
 }
 
 # 1h missing rates by symbol, from the measured dataset.
@@ -122,11 +132,18 @@ _VOL_BIAS_THRESHOLD_PCT = 10.0
 # Below this coverage (days), 5m windows are too short for robust features.
 _MIN_COVERAGE_DAYS = 60.0
 
-# TIER_0 allows up to this 5m missing rate before refusing usability.
-# Set at 80% so that SLERF (86.5%) is refused but BODEN/MOTHER/MICHI (81%)
-# are flagged as vol-biased but not outright refused. The test is on 1h for
-# TIER_0 since we only have OHLCV.
+# TIER_0 allows up to this 1h missing rate before refusing usability. 1h is
+# the binding series for TIER_0 signals since we only have OHLCV.
 _TIER0_MAX_1H_MISSING_PCT = 35.0
+
+# TIER_0 allows up to this 5m missing rate before refusing usability.
+# Set at 85% so that SLERF (86.5%, MEASURED_5M_MISSING) is refused but
+# BODEN/MOTHER/MICHI (81%) are flagged as vol-biased but not outright
+# refused, per the module docstring's stated intent. (A prior version of
+# this threshold was a hardcoded 87.0, which let SLERF's 86.5% through as
+# "usable" — exactly the coin BACKTEST-CONTRACTS.md §7 cites as the one
+# that must be excluded.)
+_TIER0_MAX_5M_MISSING_PCT = 85.0
 
 # For TIER_2+ the bar quality matters less because fills use quote ladders,
 # not bar closes. The threshold is relaxed to 50% to preserve more coins.
@@ -153,7 +170,7 @@ class GapBucket:
 class QualityReport:
     """Data-quality summary for one (asset, timeframe) pair.
 
-    All rates are percentages (0–100). All durations are seconds. All counts are
+    All rates are percentages (0-100). All durations are seconds. All counts are
     bar counts, not row counts (they are the same unless there are rejected rows,
     which in practice does not happen in the backfilled dataset).
 
@@ -161,7 +178,7 @@ class QualityReport:
     features. A coin with ``vol_biased=True`` will produce inflated vol estimates
     for any window that contains a gap, which biases the baseline strategy toward
     false negatives (refusing trades) because ``half_width = interval_vol_multiple
-    × realized_vol_pct`` is subtracted from the forecast. False negatives are
+    x realized_vol_pct`` is subtracted from the forecast. False negatives are
     less dangerous than false positives, but they are still wrong.
 
     ``usable`` is the combined verdict. A coin that is not ``usable`` should be
@@ -193,7 +210,7 @@ def build_report(meta: SeriesMeta, *, symbol: str = "") -> QualityReport:
 
     This is the primary entry point. ``meta`` comes from ``backfill.read_manifest``.
     The report is computed purely from the manifest, not by re-reading bars, so
-    it is fast even for the full 24-coin × 2-timeframe set.
+    it is fast even for the full 24-coin x 2-timeframe set.
 
     ``symbol`` is for display only — the mint address on ``meta`` is the identity.
     We accept it separately because ``SeriesMeta`` carries ``symbol`` as a
@@ -244,10 +261,11 @@ def build_report(meta: SeriesMeta, *, symbol: str = "") -> QualityReport:
                 f"{_TIER0_MAX_1H_MISSING_PCT}%: exclude from aggregate"
             )
     else:
-        usable = missing_rate_pct < 87.0 and not coverage_short
-        if missing_rate_pct >= 87.0:
+        usable = missing_rate_pct < _TIER0_MAX_5M_MISSING_PCT and not coverage_short
+        if missing_rate_pct >= _TIER0_MAX_5M_MISSING_PCT:
             reasons.append(
-                f"5m missing rate {missing_rate_pct:.1f}% >= 87.0%: "
+                f"5m missing rate {missing_rate_pct:.1f}% >= "
+                f"{_TIER0_MAX_5M_MISSING_PCT}%: "
                 "effectively a sparse trade log, not a bar series"
             )
 
@@ -301,7 +319,7 @@ def usable_for(report: QualityReport, tier: FidelityTier) -> bool:
         # We use the same threshold as the report's ``usable`` field.
         if report.timeframe == Timeframe.H1.value:
             return report.missing_rate_pct < _TIER0_MAX_1H_MISSING_PCT
-        return report.missing_rate_pct < 87.0
+        return report.missing_rate_pct < _TIER0_MAX_5M_MISSING_PCT
 
     if tier is FidelityTier.TIER_1:
         return report.missing_rate_pct < _TIER2_MAX_MISSING_PCT
@@ -322,7 +340,7 @@ def missing_rate_pct_for_window(
     that sits entirely in a data-dense period is usable even if the full series
     has a high aggregate missing rate.
 
-    Returns a percentage (0–100). An empty window returns 0.0.
+    Returns a percentage (0-100). An empty window returns 0.0.
 
     Reuses ``backfill.window_gaps`` so the gap accounting matches the rest of
     the codebase.
@@ -339,12 +357,12 @@ def missing_rate_pct_for_window(
 def _build_gap_histogram(meta: SeriesMeta) -> tuple[GapBucket, ...]:
     """Bucket the series gaps by length.
 
-    Buckets: [1], [2–5], [6–20], [21–100], [101+].
+    Buckets: [1], [2-5], [6-20], [21-100], [101+].
     These boundaries are chosen to distinguish:
       - 1-bar gaps (single silent interval, low impact on vol)
-      - 2–5 bars (short run, small vol bias)
-      - 6–20 bars (one to three hours on 5m, noticeable bias)
-      - 21–100 bars (one day or more, large bias)
+      - 2-5 bars (short run, small vol bias)
+      - 6-20 bars (one to three hours on 5m, noticeable bias)
+      - 21-100 bars (one day or more, large bias)
       - 101+ bars (multi-day, series is locally a trade log)
     """
     buckets: list[tuple[int, int]] = [(1, 1), (2, 5), (6, 20), (21, 100), (101, 10**9)]
@@ -363,11 +381,11 @@ def _build_gap_histogram(meta: SeriesMeta) -> tuple[GapBucket, ...]:
 
 
 __all__ = [
-    "GapBucket",
     "MEASURED_1H_MISSING",
     "MEASURED_5M_MISSING",
-    "QualityReport",
     "SHORT_COVERAGE_DAYS",
+    "GapBucket",
+    "QualityReport",
     "build_report",
     "missing_rate_pct_for_window",
     "usable_for",

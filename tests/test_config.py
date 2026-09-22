@@ -27,6 +27,7 @@ from __future__ import annotations
 import textwrap
 import tomllib
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -510,7 +511,7 @@ def test_prices_are_read_from_the_file(tmp_path):
 
 
 def _model(**overrides) -> ModelConfig:
-    fields = {
+    fields: dict[str, Any] = {
         "name": "claude-opus-5",
         "effort": "high",
         "max_tokens": 8000,
@@ -793,7 +794,7 @@ def test_failed_tx_rate_of_zero_is_allowed(tmp_path):
 
 
 def _execution(**overrides) -> ExecutionConfig:
-    fields = {
+    fields: dict[str, Any] = {
         "slippage_bps_fallback": 50.0,
         "gas_usd_per_swap": 0.21,
         "failed_tx_rate": 0.06,
@@ -864,7 +865,7 @@ def test_pool_fee_table_is_read_from_the_file(tmp_path):
 
 
 def _data(**overrides) -> DataConfig:
-    fields = {
+    fields: dict[str, Any] = {
         "dexscreener_base": "https://api.dexscreener.com",
         "geckoterminal_base": "https://api.geckoterminal.com/api/v2",
         "jupiter_base": "https://lite-api.jup.ag",
@@ -956,7 +957,7 @@ def test_an_absent_author_hash_key_is_none_not_a_committed_default(tmp_path):
 
 
 def _sentiment(**overrides) -> SentimentConfig:
-    fields = {
+    fields: dict[str, Any] = {
         "enabled": True,
         "cache_ttl_seconds": 600,
         "lookback_hours": 24,

@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import math
 
-
 # ``QuoteLadder`` and ``QuoteLadderRung`` are imported lazily inside the
 # functions that need them. This avoids a hard dependency on ``histdata``
 # when this module is used in contexts where that package is not yet wired up.
@@ -77,7 +76,7 @@ def spread_bps(
 
     # Use the smallest rung as the spread proxy. ``QuoteLadderRung`` is
     # guaranteed to have ``price_impact_pct`` as a finite float by its schema.
-    smallest = min(rungs, key=lambda r: r.in_amount_atomic)  # type: ignore[attr-defined]
+    smallest = min(rungs, key=lambda r: r.in_amount_atomic)
     impact_pct = float(smallest.price_impact_pct)
     if not math.isfinite(impact_pct):
         return None, "price_impact_pct on smallest rung is non-finite"
@@ -113,7 +112,7 @@ def depth_usd_at_size(
     if rung is None:
         return None, _REASON_RUNG_NOT_FOUND
 
-    depth_usd = float(rung.in_amount_atomic) * price_usd_per_atomic  # type: ignore[attr-defined]
+    depth_usd = float(rung.in_amount_atomic) * price_usd_per_atomic
     return depth_usd if math.isfinite(depth_usd) else None, ""
 
 
@@ -138,7 +137,7 @@ def price_impact_pct_at_size(
     if rung is None:
         return None, _REASON_RUNG_NOT_FOUND
 
-    impact = float(rung.price_impact_pct)  # type: ignore[attr-defined]
+    impact = float(rung.price_impact_pct)
     return impact if math.isfinite(impact) else None, ""
 
 

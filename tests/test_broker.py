@@ -298,7 +298,7 @@ def test_live_mode_cannot_be_constructed(tmp_path: Path) -> None:
         LocalPaperBroker(make_cfg(tmp_path), mode=ExecutionMode.LIVE)
     with pytest.raises(LiveModeUnsupported):
         assert_live_supported(ExecutionMode.LIVE)
-    assert assert_live_supported(ExecutionMode.PAPER) is None
+    assert_live_supported(ExecutionMode.PAPER)  # must not raise
 
 
 # ---------------------------------------------------------------------------

@@ -74,7 +74,10 @@ from .pipeline import (
 )
 from .registry import FeatureDefinition, FeatureRegistry
 
-__all__ = [
+# RUF022 is suppressed below: the names are grouped by the module they come
+# from and sorted within each group, which is how a reader looks a feature up.
+# A flat alphabetical list would interleave the five families and lose that.
+__all__ = [  # noqa: RUF022
     # registry
     "FeatureDefinition",
     "FeatureRegistry",

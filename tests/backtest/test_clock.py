@@ -6,8 +6,9 @@ comment above each test states which guard that is.
 
 from __future__ import annotations
 
+import datetime as dt
 import time
-from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -16,6 +17,18 @@ from memetrader.backtest.clock import (
     SimulatedClock,
     WallClockAccessError,
 )
+
+# Root of the source tree the static datetime.now/utcnow scan below covers.
+_SRC_ROOT = Path(__file__).resolve().parents[2] / "src" / "memetrader"
+
+# Modules allowed to call datetime.now()/datetime.utcnow() directly, because
+# they are not part of the replay call graph (see clock.py's documented gap:
+# the SimulatedClock guard cannot catch `from datetime import datetime`
+# imports performed before the guard is installed, so non-replay call sites
+# are policed statically instead). Empty today — nothing in memetrader needs
+# a raw wall-clock read; new offenders must either use SimulatedClock or be
+# justified here.
+_DATETIME_NOW_ALLOWLIST: frozenset[str] = frozenset()
 
 
 # ---------------------------------------------------------------------------
@@ -85,31 +98,69 @@ def test_wall_clock_guard_time_time() -> None:
     replay would produce non-deterministic results: two runs over the same
     data at different real-world times would produce different outputs.
     """
-    with SimulatedClock(run_id="guard-test", start=0.0):
-        with pytest.raises(WallClockAccessError):
-            time.time()
+    with (
+        SimulatedClock(run_id="guard-test", start=0.0),
+        pytest.raises(WallClockAccessError),
+    ):
+        time.time()
 
 
 def test_wall_clock_guard_datetime_now() -> None:
-    """Guard: datetime.now() raises while a SimulatedClock is active."""
-    with SimulatedClock(run_id="guard-test", start=0.0):
-        with pytest.raises(WallClockAccessError):
-            datetime.now(tz=timezone.utc)
+    """Guard: datetime.datetime.now() raises while a SimulatedClock is active.
+
+    The guard works by rebinding ``datetime.datetime`` to a raising subclass
+    (patching ``datetime.now`` directly is impossible: ``datetime`` is an
+    immutable C type). That means this test must go through the module
+    attribute (``import datetime as dt`` ... ``dt.datetime.now(...)``) rather
+    than binding the name early via ``from datetime import datetime`` — the
+    latter would capture the original class before the guard is installed
+    and is, by design, NOT caught by the runtime guard. See the documented
+    gap in clock.py's module docstring, and
+    ``test_no_direct_datetime_now_in_src`` below for the static check that
+    covers that gap.
+    """
+    with (
+        SimulatedClock(run_id="guard-test", start=0.0),
+        pytest.raises(WallClockAccessError),
+    ):
+        dt.datetime.now(tz=dt.UTC)
+
+
+def test_wall_clock_guard_datetime_utcnow() -> None:
+    """Guard: datetime.datetime.utcnow() also raises while active."""
+    with (
+        SimulatedClock(run_id="guard-test-utcnow", start=0.0),
+        pytest.raises(WallClockAccessError),
+    ):
+        dt.datetime.utcnow()  # noqa: DTZ003
+
+
+def test_wall_clock_guard_time_time_ns() -> None:
+    """Guard: time.time_ns() raises while a SimulatedClock is active."""
+    with (
+        SimulatedClock(run_id="guard-test-ns", start=0.0),
+        pytest.raises(WallClockAccessError),
+    ):
+        time.time_ns()
 
 
 def test_wall_clock_guard_restored_after_close() -> None:
-    """After the clock exits, time.time() works again."""
+    """After the clock exits, time.time() and datetime.now() work again."""
     with SimulatedClock(run_id="restore-test", start=0.0):
         pass  # __exit__ calls close()
     t = time.time()
     assert t > 0.0, "time.time() should be callable after clock exits"
+    now = dt.datetime.now(tz=dt.UTC)
+    assert now.year >= 2024, "datetime.now() should be callable after clock exits"
 
 
 def test_wall_clock_guard_restored_on_exception() -> None:
     """The guard is restored even when an exception terminates the with-block."""
-    with pytest.raises(RuntimeError, match="deliberate"):
-        with SimulatedClock(run_id="exc-test", start=0.0):
-            raise RuntimeError("deliberate")
+    with (
+        pytest.raises(RuntimeError, match="deliberate"),
+        SimulatedClock(run_id="exc-test", start=0.0),
+    ):
+        raise RuntimeError("deliberate")
     # Should not raise:
     time.time()
 
@@ -120,9 +171,45 @@ def test_nested_clocks_raise() -> None:
     The wall-clock guard is process-wide and cannot be shared between two
     independent replay sessions.
     """
-    with SimulatedClock(run_id="outer", start=0.0):
+    with (
+        SimulatedClock(run_id="outer", start=0.0),
+        pytest.raises(ClockError, match="already active"),
+    ):
+        SimulatedClock(run_id="inner", start=0.0).__enter__()
+
+
+def test_nested_clock_rejection_leaves_outer_guard_intact() -> None:
+    """Regression test for the bug this module was rewritten to fix.
+
+    A rejected nested activation must not disturb the outer clock's guard:
+    time.time()/time.time_ns()/datetime.now() must still raise, and the
+    active clock must still be the outer one (i.e. the outer clock's own
+    ``close()`` still tears its guard down cleanly afterwards). Before the
+    fix, any failure partway through installing a guard (e.g. the
+    ``datetime.now`` assignment that used to raise ``TypeError``) could
+    leave ``time.time`` permanently patched with no way to undo it, because
+    the exception escaped ``__enter__`` before ``__exit__``/``close()`` ever
+    ran. The nested-clock rejection path exercises the same "raise inside
+    __enter__" shape from the caller's side.
+    """
+    outer = SimulatedClock(run_id="outer-survives", start=0.0)
+    with outer:
         with pytest.raises(ClockError, match="already active"):
-            SimulatedClock(run_id="inner", start=0.0).__enter__()
+            SimulatedClock(run_id="inner-rejected", start=0.0).__enter__()
+
+        # Outer guard must still be fully active after the rejected nested
+        # activation attempt.
+        with pytest.raises(WallClockAccessError):
+            time.time()
+        with pytest.raises(WallClockAccessError):
+            time.time_ns()
+        with pytest.raises(WallClockAccessError):
+            dt.datetime.now(tz=dt.UTC)
+
+    # And the outer clock's own close() still restores everything cleanly.
+    time.time()
+    time.time_ns()
+    dt.datetime.now(tz=dt.UTC)
 
 
 # ---------------------------------------------------------------------------
@@ -195,3 +282,52 @@ def test_now_at_start() -> None:
 def test_run_id_preserved() -> None:
     clock = SimulatedClock(run_id="my-run", start=0.0)
     assert clock.run_id == "my-run"
+
+
+# ---------------------------------------------------------------------------
+# Static coverage for the documented runtime-guard gap
+# ---------------------------------------------------------------------------
+
+
+def test_no_direct_datetime_now_in_src() -> None:
+    """Static check covering the gap the runtime guard cannot close.
+
+    ``SimulatedClock``'s guard works by rebinding ``datetime.datetime`` to a
+    raising subclass, which cannot intercept a ``from datetime import
+    datetime`` binding made before the guard was installed (see clock.py's
+    module docstring). Rather than rely on every call site going through
+    ``import datetime`` correctly, we forbid direct ``datetime.now(``/
+    ``datetime.utcnow(`` call sites in the source tree outright: any replayed
+    code should be getting its time from ``SimulatedClock`` instead, and any
+    non-replay code that legitimately needs a wall-clock read should be
+    listed in ``_DATETIME_NOW_ALLOWLIST`` with a justification in the comment
+    next to it.
+    """
+    # clock.py itself defines the guard's now()/utcnow() overrides, which
+    # raise rather than read the wall clock, and its docstrings/comments
+    # discuss ``datetime.now()`` in prose — it is the one file the scan
+    # would otherwise (correctly, but uselessly) flag, so it is excluded
+    # here rather than via the allowlist, which is reserved for call sites
+    # that genuinely execute a wall-clock read.
+    _clock_module_path = (_SRC_ROOT / "backtest" / "clock.py").resolve()
+
+    offenders: list[str] = []
+    for path in sorted(_SRC_ROOT.rglob("*.py")):
+        if path.resolve() == _clock_module_path:
+            continue
+        rel = path.relative_to(_SRC_ROOT.parents[1]).as_posix()
+        if rel in _DATETIME_NOW_ALLOWLIST:
+            continue
+        text = path.read_text(encoding="utf-8")
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if "datetime.now(" in line or ".utcnow(" in line:
+                offenders.append(f"{rel}:{lineno}: {stripped}")
+    assert not offenders, (
+        "Direct datetime.now()/datetime.utcnow() call sites found outside the "
+        "SimulatedClock guard's own implementation. Read simulated time from "
+        "SimulatedClock instead, or add a justified entry to "
+        "_DATETIME_NOW_ALLOWLIST:\n" + "\n".join(offenders)
+    )

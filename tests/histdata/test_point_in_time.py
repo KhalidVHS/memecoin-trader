@@ -15,9 +15,8 @@ from __future__ import annotations
 import pytest
 
 from memetrader.histdata.point_in_time import ReplayState
-from memetrader.histdata.schemas import PoolState, QuoteLadderRung, QuoteLadder
+from memetrader.histdata.schemas import PoolState, QuoteLadder, QuoteLadderRung
 from memetrader.types import Candle, Side, Timeframe
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -25,14 +24,22 @@ from memetrader.types import Candle, Side, Timeframe
 
 
 def _closed_candle(ts: float, close: float = 1.0) -> Candle:
-    return Candle(ts=ts, open=close, high=close * 1.01, low=close * 0.99, close=close,
-                  volume=100.0, closed=True)
+    return Candle(
+        ts=ts,
+        open=close,
+        high=close * 1.01,
+        low=close * 0.99,
+        close=close,
+        volume=100.0,
+        closed=True,
+    )
 
 
 def _open_candle(ts: float) -> Candle:
     """A forming bar — not yet closed."""
-    return Candle(ts=ts, open=1.0, high=1.01, low=0.99, close=1.0,
-                  volume=50.0, closed=False)
+    return Candle(
+        ts=ts, open=1.0, high=1.01, low=0.99, close=1.0, volume=50.0, closed=False
+    )
 
 
 MINT_A = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"  # BONK mint
@@ -53,16 +60,16 @@ def test_refuses_unclosed_bar() -> None:
     state = ReplayState(now=0.0)
     forming = _open_candle(ts=1_000_000.0)
     with pytest.raises(ValueError, match="has not closed"):
-        state.add_bar(forming, asset_id=MINT_A, timeframe=Timeframe.H1,
-                      available_time=1_000_000.0)
+        state.add_bar(
+            forming, asset_id=MINT_A, timeframe=Timeframe.H1, available_time=1_000_000.0
+        )
 
 
 def test_accepts_closed_bar() -> None:
     """Closed bars are accepted without error."""
     state = ReplayState(now=0.0)
     bar = _closed_candle(ts=1_000_000.0)
-    state.add_bar(bar, asset_id=MINT_A, timeframe=Timeframe.H1,
-                  available_time=1_000_001.0)
+    state.add_bar(bar, asset_id=MINT_A, timeframe=Timeframe.H1, available_time=1_000_001.0)
     # Nothing raised
 
 
@@ -83,13 +90,15 @@ def test_future_bar_invisible() -> None:
 
     # This bar is available 1 second in the future — must not appear
     future_bar = _closed_candle(ts=1_000_000.0, close=99999.0)
-    state.add_bar(future_bar, asset_id=MINT_A, timeframe=Timeframe.H1,
-                  available_time=now + 1.0)
+    state.add_bar(
+        future_bar, asset_id=MINT_A, timeframe=Timeframe.H1, available_time=now + 1.0
+    )
 
     # Current-time bar
     past_bar = _closed_candle(ts=999_999.0, close=1.0)
-    state.add_bar(past_bar, asset_id=MINT_A, timeframe=Timeframe.H1,
-                  available_time=now - 1.0)
+    state.add_bar(
+        past_bar, asset_id=MINT_A, timeframe=Timeframe.H1, available_time=now - 1.0
+    )
 
     result = state.bars(MINT_A, Timeframe.H1, lookback=100)
     assert len(result) == 1
@@ -102,8 +111,7 @@ def test_future_bar_appears_after_clock_advance() -> None:
     state = ReplayState(now=t0)
 
     bar = _closed_candle(ts=1_000_000.0, close=42.0)
-    state.add_bar(bar, asset_id=MINT_A, timeframe=Timeframe.H1,
-                  available_time=t0 + 100.0)
+    state.add_bar(bar, asset_id=MINT_A, timeframe=Timeframe.H1, available_time=t0 + 100.0)
 
     # Not visible yet
     assert len(state.bars(MINT_A, Timeframe.H1, lookback=100)) == 0
@@ -130,18 +138,26 @@ def test_raising_available_time_delays_visibility() -> None:
     """
     t_bar = 1_000_000.0
     t_early_available = 1_001_000.0  # bar + 1000s
-    t_late_available = 1_002_000.0   # bar + 2000s
+    t_late_available = 1_002_000.0  # bar + 2000s
     t_query = 1_001_500.0  # between early and late
 
     # State with early available_time
     state_early = ReplayState(now=t_query)
-    state_early.add_bar(_closed_candle(t_bar, close=1.0), asset_id=MINT_A,
-                        timeframe=Timeframe.H1, available_time=t_early_available)
+    state_early.add_bar(
+        _closed_candle(t_bar, close=1.0),
+        asset_id=MINT_A,
+        timeframe=Timeframe.H1,
+        available_time=t_early_available,
+    )
 
     # State with late available_time
     state_late = ReplayState(now=t_query)
-    state_late.add_bar(_closed_candle(t_bar, close=1.0), asset_id=MINT_A,
-                       timeframe=Timeframe.H1, available_time=t_late_available)
+    state_late.add_bar(
+        _closed_candle(t_bar, close=1.0),
+        asset_id=MINT_A,
+        timeframe=Timeframe.H1,
+        available_time=t_late_available,
+    )
 
     # Early state sees the bar at t_query
     assert len(state_early.bars(MINT_A, Timeframe.H1, lookback=10)) == 1
@@ -210,8 +226,9 @@ def test_lookback_limits_returned_bars() -> None:
     for i in range(n):
         ts = base_ts + i * interval
         bar = _closed_candle(ts=ts, close=float(i + 1))
-        state.add_bar(bar, asset_id=MINT_A, timeframe=Timeframe.H1,
-                      available_time=ts + interval)
+        state.add_bar(
+            bar, asset_id=MINT_A, timeframe=Timeframe.H1, available_time=ts + interval
+        )
 
     result = state.bars(MINT_A, Timeframe.H1, lookback=3)
     assert len(result) == 3
@@ -229,8 +246,12 @@ def test_bars_oldest_first() -> None:
 
     for i in range(n):
         ts = base_ts + i * interval
-        state.add_bar(_closed_candle(ts=ts), asset_id=MINT_A, timeframe=Timeframe.H1,
-                      available_time=ts + interval)
+        state.add_bar(
+            _closed_candle(ts=ts),
+            asset_id=MINT_A,
+            timeframe=Timeframe.H1,
+            available_time=ts + interval,
+        )
 
     result = state.bars(MINT_A, Timeframe.H1, lookback=10)
     assert all(result[i].ts < result[i + 1].ts for i in range(len(result) - 1))
@@ -374,8 +395,12 @@ def test_bar_count_all_bars_regardless_of_now() -> None:
     state = ReplayState(now=0.0)
     for i in range(5):
         bar = _closed_candle(ts=float(i * 3600), close=1.0)
-        state.add_bar(bar, asset_id=MINT_A, timeframe=Timeframe.H1,
-                      available_time=float((i + 1) * 3600))
+        state.add_bar(
+            bar,
+            asset_id=MINT_A,
+            timeframe=Timeframe.H1,
+            available_time=float((i + 1) * 3600),
+        )
     # now=0 means none are visible via bars(), but bar_count sees all
     assert state.bar_count(MINT_A, Timeframe.H1) == 5
     assert state.bars(MINT_A, Timeframe.H1, lookback=100) == ()

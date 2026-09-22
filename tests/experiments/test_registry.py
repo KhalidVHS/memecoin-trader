@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 
 from memetrader.experiments.registry import (
-    CertifyResult,
     HoldoutAccessError,
     PermissionError,
     Registry,
@@ -21,7 +20,9 @@ from memetrader.experiments.registry import (
 EXP = "exp-test-registry-001"
 
 
-def _trial(trial_id: str, *, actor="human", revision_of=None, abandoned=False) -> TrialRegistration:
+def _trial(
+    trial_id: str, *, actor="human", revision_of=None, abandoned=False
+) -> TrialRegistration:
     return TrialRegistration(
         trial_id=trial_id,
         experiment_id=EXP,

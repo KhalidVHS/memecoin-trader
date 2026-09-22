@@ -36,8 +36,8 @@ from .schemas import (
 from .universe import UniverseCatalog, UniverseEntry
 
 __all__ = [
-    "Catalog",
     "CandleRecord",
+    "Catalog",
     "LabelRecord",
     "PartitionInfo",
     "PointInTimeState",

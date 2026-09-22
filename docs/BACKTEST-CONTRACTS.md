@@ -231,6 +231,21 @@ sequence or it is not testing the deployed system:
    → append intent → submit → report → append fill + state.
 10. Append `DecisionRecord`.
 
+**Steps 6 and 8 are deliberately not reproduced verbatim.** The live
+`strategy.decide(...)` is keyed to `EvidenceBundle` and venue-shaped inputs,
+several of which exist only against a live venue and have no point-in-time
+analogue to replay. The backtest substitutes the narrower `BacktestStrategy`
+protocol (`strategies/baselines.py`) — `propose(state, portfolio, now, run_id)
+-> tuple[OrderIntent, ...]` — keyed to the replay's own `PointInTimeState`.
+
+This is the one place the mirror is intentionally imperfect, and the trade is
+worth naming: a strategy that reads a live-only field cannot be backtested at
+all, so the protocol excludes those fields rather than letting a backtest
+silently fabricate them. **Everything either side of these two steps — the
+ordering, the stops-before-strategy rule, the band, SELLs-before-BUYs — is
+reproduced exactly**, because those are where the divergence would change the
+economics rather than the input shape.
+
 **A decision from a bar close must not fill at that close.** Enforced twice:
 `EVENT_PRIORITY` puts `DECISION_TICK` (70) before `ORDER_READY` (80) and
 `EXECUTION` (90) at equal timestamps, *and* `execution/latency.py` advances the

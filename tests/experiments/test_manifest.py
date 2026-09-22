@@ -10,10 +10,12 @@ suite.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from memetrader.experiments.manifest import (
+    Manifest,
     build_manifest,
     manifest_hash,
     read_manifest,
@@ -24,14 +26,14 @@ from memetrader.types import FidelityTier
 EXP_ID = "exp-test-001"
 
 
-def _base_manifest(tmp_path: Path, **kwargs):
+def _base_manifest(tmp_path: Path, **kwargs: Any) -> Manifest:
     """Construct a manifest in a tmp_path (no git repo present).
 
     Callers may override any field via kwargs. Defaults are applied first so
     that kwargs always win — ``build_manifest`` does not accept duplicate keys,
     so we merge the defaults dict then pass it unpacked.
     """
-    defaults = {
+    defaults: dict[str, Any] = {
         "experiment_id": EXP_ID,
         "trial_number": 1,
         "fidelity_tier": FidelityTier.TIER_0,

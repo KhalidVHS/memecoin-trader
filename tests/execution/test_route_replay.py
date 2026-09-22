@@ -216,7 +216,9 @@ class TestBasicReplay:
         )
         assert result_with_fee is not None
         assert result_no_fee is not None
-        assert result_no_fee.quote.out_amount_atomic >= result_with_fee.quote.out_amount_atomic
+        assert (
+            result_no_fee.quote.out_amount_atomic >= result_with_fee.quote.out_amount_atomic
+        )
 
     def test_two_hop_connected_route(self) -> None:
         hop1 = _make_hop(10_000_000, 10_000_000, 30, USDC, SOL)
@@ -312,20 +314,18 @@ def test_no_fee_replay_ge_fee_replay(
 ) -> None:
     """Disabling fees (apply_hop_fees=False) never reduces the output."""
     hop = _make_hop(reserve_in, reserve_out, fee_bps, USDC, SOL)
-    kwargs: dict = dict(
-        symbol="SOL",
-        side=Side.BUY,
-        in_amount_atomic=amount,
-        slippage_bps=slippage_bps,
-        provenance=RouteProvenance.HISTORICAL,
-        now=1_700_000_000.0,
-    )
+    kwargs: dict = {
+        "symbol": "SOL",
+        "side": Side.BUY,
+        "in_amount_atomic": amount,
+        "slippage_bps": slippage_bps,
+        "provenance": RouteProvenance.HISTORICAL,
+        "now": 1_700_000_000.0,
+    }
     result_fee = replay_route([hop], **kwargs, apply_hop_fees=True)
     result_nofee = replay_route([hop], **kwargs, apply_hop_fees=False)
     if result_fee is not None and result_nofee is not None:
-        assert (
-            result_nofee.quote.out_amount_atomic >= result_fee.quote.out_amount_atomic
-        )
+        assert result_nofee.quote.out_amount_atomic >= result_fee.quote.out_amount_atomic
 
 
 @given(

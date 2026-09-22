@@ -66,7 +66,7 @@ import random
 from dataclasses import dataclass, field
 from typing import Literal
 
-from ..types import ValidationError, finite, non_negative, positive
+from memetrader.types import ValidationError, finite, non_negative
 
 # ---------------------------------------------------------------------------
 # Structural minimum latency
@@ -138,7 +138,7 @@ class StageConfig:
                 return 0.0
             mu = math.log(self.p50_s)
             return rng.lognormvariate(mu, self.spread_s)
-        raise ValidationError(f"unknown distribution kind {self.kind!r}")  # type: ignore[unreachable]
+        raise ValidationError(f"unknown distribution kind {self.kind!r}")
 
 
 # ---------------------------------------------------------------------------

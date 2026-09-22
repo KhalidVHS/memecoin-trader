@@ -26,7 +26,6 @@ from memetrader.validation.splits import (
     Interval,
     LabeledObservation,
     PurgedWalkForward,
-    SplitResult,
     embargo_window,
     extract_locked_holdout,
     purge_training,
@@ -185,7 +184,7 @@ class TestPurgeTraining:
                 label_end_ts=_epoch(10, 2),  # 4 hours later, crosses into val
             )
         ]
-        safe, n_purged, n_embargoed = purge_training(
+        safe, n_purged, _n_embargoed = purge_training(
             obs,
             protected_intervals=[val, test],
             train_interval=train_interval,
@@ -225,21 +224,10 @@ class TestPurgeTraining:
         test = Interval(_epoch(20), _epoch(30))
         # Embargo is 1 day after val.end and after test.end.
         embargo_secs = _DAY
-        train_interval = Interval(_epoch(0), _epoch(10))
-        # An obs at day 9.5 with a 1-second label (no purge overlap with val/test),
-        # but within embargo_secs of val.start.
-        # val.end = epoch(20); embargo zone = [epoch(20), epoch(21)).
-        # obs_time = epoch(9.5) is in train, label ends at epoch(9.5)+1 < epoch(10).
-        # Not purged (label doesn't overlap val/test), but in embargo zone? No:
-        # embargo zone starts at epoch(20), obs is at epoch(9.5). Not embargoed either.
-        # Let's put obs in [val.end, val.end + embargo_secs) = [epoch(20), epoch(21))
-        # but that's outside train_interval [epoch(0), epoch(10)).
-        # The correct test: obs_time in train interval but near the END of train.
-        # val starts at epoch(10). Embargo before val = not modelled; embargo is
-        # AFTER test/val. So let's test embargo after test.
-        # An observation at epoch(30, 0.5h) = epoch(30) + 1800s would be in
-        # the embargo zone [test.end, test.end+embargo_secs) = [epoch(30), epoch(31)).
-        # But it must also be in train_interval. Let's use a train that goes to epoch(32).
+        # The embargo runs *after* a protected interval, so the observation has
+        # to sit past test.end and still be inside train — hence a train interval
+        # that extends to day 32 rather than stopping at val.start.
+        # Embargo zone = [test.end, test.end + embargo_secs) = [day 30, day 31).
         train_interval2 = Interval(_epoch(0), _epoch(32))
         obs2 = [
             LabeledObservation(
@@ -249,7 +237,7 @@ class TestPurgeTraining:
                 label_end_ts=_epoch(30, 0.5) + 1.0,  # tiny label, no overlap with test
             )
         ]
-        safe2, n_purged2, n_embargoed2 = purge_training(
+        safe2, _n_purged2, n_embargoed2 = purge_training(
             obs2,
             protected_intervals=[val, test],
             train_interval=train_interval2,
@@ -381,8 +369,6 @@ class TestEmbargoAcrossDensity:
 
     def test_embargo_wall_clock_across_density(self) -> None:
         # Short data span: 60 days, fold at day 30, val [30,35), test [35,40).
-        data_start = 0.0
-        fold_end = _epoch(40)  # after test
         embargo_secs = _DAY * 2  # 2 days
 
         val = Interval(_epoch(30), _epoch(35))
@@ -396,15 +382,13 @@ class TestEmbargoAcrossDensity:
         # Sparse asset: 1 obs per 37 minutes. Same zone has ~48×60/37 ≈ 78 obs.
         slerf = _sparse_observations("SLERF", _epoch(0), _epoch(45), 37.0 / 60.0, 0.1)
 
-        all_obs = bonk + slerf
-
-        safe_b, n_purged_b, n_embargoed_b = purge_training(
+        safe_b, _n_purged_b, n_embargoed_b = purge_training(
             bonk,
             protected_intervals=[val, test],
             train_interval=train_interval,
             embargo_secs=embargo_secs,
         )
-        safe_s, n_purged_s, n_embargoed_s = purge_training(
+        safe_s, _n_purged_s, n_embargoed_s = purge_training(
             slerf,
             protected_intervals=[val, test],
             train_interval=train_interval,
@@ -544,7 +528,7 @@ class TestSameBoundariesAllAssets:
 
         # Each fold's wall-clock boundaries must be identical regardless of which
         # asset list was used.
-        for sc, sb, ss in zip(splits_combined, splits_bonk, splits_slerf):
+        for sc, sb, ss in zip(splits_combined, splits_bonk, splits_slerf, strict=True):
             assert sc.fold.train_start == sb.fold.train_start == ss.fold.train_start
             assert sc.fold.train_end == sb.fold.train_end == ss.fold.train_end
             assert sc.fold.val_start == sb.fold.val_start == ss.fold.val_start
@@ -684,7 +668,7 @@ class TestExtractLockedHoldout:
         obs = _dense_observations("BONK", data_start, data_end, 1.0, 4.0)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            dev_idx, ho_idx, record = extract_locked_holdout(
+            dev_idx, ho_idx, _record = extract_locked_holdout(
                 obs,
                 data_start=data_start,
                 data_end=data_end,

@@ -54,8 +54,8 @@ from __future__ import annotations
 
 from typing import Literal
 
-from ..config import ExecutionConfig
-from ..types import CostBreakdown, Fill, OrderState, finite, non_negative
+from memetrader.config import ExecutionConfig
+from memetrader.types import CostBreakdown, Fill, OrderState, finite, non_negative
 
 # ---------------------------------------------------------------------------
 # Public sentinel type
@@ -319,14 +319,13 @@ def _latency_cost(
     # lets us reconstruct the UI quantity without access to the token meta.
     quantity_ui = fill.token_amount_atomic / (10**fill.token_decimals)
 
-    from ..types import Side
+    from memetrader.types import Side
 
     if fill.side is Side.BUY:
         # A price rise hurts a buyer: we paid more than we expected to.
         return price_move * quantity_ui
-    else:
-        # A price fall hurts a seller: we received less than we expected to.
-        return -price_move * quantity_ui
+    # A price fall hurts a seller: we received less than we expected to.
+    return -price_move * quantity_ui
 
 
 __all__ = [

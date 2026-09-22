@@ -33,6 +33,7 @@ the "nothing is hardcoded, it all comes from config" family.
 from __future__ import annotations
 
 from dataclasses import replace
+from types import EllipsisType
 
 import pytest
 
@@ -230,7 +231,7 @@ def entry(
     engine: RiskEngine = ENGINE,
     state: PortfolioState | None = None,
     risk_state: RiskState = OPEN_STATE,
-    snapshot: CoinSnapshot | None = ...,  # type: ignore[assignment]
+    snapshot: CoinSnapshot | EllipsisType | None = ...,
     volatility_pct: float | None = 8.0,
     now: float = NOW,
     **kw,

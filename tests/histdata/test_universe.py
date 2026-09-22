@@ -15,21 +15,19 @@ from pathlib import Path
 import pytest
 
 from memetrader.histdata.universe import (
-    DEFAULT_MIN_POOL_AGE_DAYS,
     UniverseCatalog,
     UniverseEntry,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
 # A real-looking but non-network timestamp: 2024-01-01 midnight UTC
-_T_JAN_2024 = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc).timestamp()
-_T_JUNE_2024 = datetime.datetime(2024, 6, 1, tzinfo=datetime.timezone.utc).timestamp()
-_T_SEP_2024 = datetime.datetime(2024, 9, 1, tzinfo=datetime.timezone.utc).timestamp()
-_T_SEP_2026 = datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc).timestamp()
+_T_JAN_2024 = datetime.datetime(2024, 1, 1, tzinfo=datetime.UTC).timestamp()
+_T_JUNE_2024 = datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC).timestamp()
+_T_SEP_2024 = datetime.datetime(2024, 9, 1, tzinfo=datetime.UTC).timestamp()
+_T_SEP_2026 = datetime.datetime(2026, 9, 1, tzinfo=datetime.UTC).timestamp()
 
 
 def _entry(
@@ -132,16 +130,17 @@ def test_survivorship_future_added_at_unchanged() -> None:
     as an eligibility gate — which is survivorship bias: only coins we had
     already discovered would appear in historical replays.
     """
-    created = _T_JAN_2024
-    eligible_from = created  # no age floor
+    created = _T_JAN_2024  # _entry applies no age floor, so eligible_from == created
     original_added_at = _T_JUNE_2024  # well before the test query time
 
     # Original universe: coin added in June 2024
-    original = _catalog(_entry(
-        asset_id="MINT_A",
-        pool_created_at=created,
-        added_at=original_added_at,
-    ))
+    original = _catalog(
+        _entry(
+            asset_id="MINT_A",
+            pool_created_at=created,
+            added_at=original_added_at,
+        )
+    )
 
     # Modified universe: coin "discovered" in Sep 2026 (far future)
     modified = original.with_entry_added_at_future("MINT_A", new_added_at=_T_SEP_2026)
@@ -194,8 +193,12 @@ def test_eligible_at_multi_coin() -> None:
     # Coin C: eligible from Jan 2024 but removed in June 2024
     a = _entry(asset_id="MINT_A", pool_id="POOL_A", pool_created_at=_T_JAN_2024)
     b = _entry(asset_id="MINT_B", pool_id="POOL_B", pool_created_at=_T_JUNE_2024)
-    c = _entry(asset_id="MINT_C", pool_id="POOL_C", pool_created_at=_T_JAN_2024,
-               removed_at=_T_JUNE_2024)
+    c = _entry(
+        asset_id="MINT_C",
+        pool_id="POOL_C",
+        pool_created_at=_T_JAN_2024,
+        removed_at=_T_JUNE_2024,
+    )
 
     cat = _catalog(a, b, c)
 
@@ -255,9 +258,7 @@ def test_from_toml_min_age_reduces_early_eligibility() -> None:
     cat_with_age = UniverseCatalog.from_toml(universe_path, min_pool_age_days=14.0)
 
     # Find a coin and verify eligible_from shifted
-    bonk_no_age = cat_no_age.entry_for_pool(
-        "5zpyutJu9ee6jFymDGoK7F6S5Kczqtc9FomP3ueKuyA9"
-    )
+    bonk_no_age = cat_no_age.entry_for_pool("5zpyutJu9ee6jFymDGoK7F6S5Kczqtc9FomP3ueKuyA9")
     bonk_with_age = cat_with_age.entry_for_pool(
         "5zpyutJu9ee6jFymDGoK7F6S5Kczqtc9FomP3ueKuyA9"
     )

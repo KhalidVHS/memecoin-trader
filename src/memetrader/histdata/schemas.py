@@ -31,7 +31,7 @@ catalog scan can detect mixed-schema partitions and refuse to merge them.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 # Bump the major version when any field is renamed, removed, or changes its
 # semantics. A catalog scan will detect the mismatch and refuse to concatenate

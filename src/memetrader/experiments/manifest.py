@@ -87,7 +87,7 @@ def _run_git(*args: str, cwd: Path | None = None) -> str | None:
         if result.returncode != 0:
             return None
         return result.stdout.strip() or None
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+    except FileNotFoundError, subprocess.TimeoutExpired, OSError:
         return None
 
 

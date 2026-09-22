@@ -495,9 +495,12 @@ def test_the_ledger_fsyncs_every_kind_of_row(
 ) -> None:
     calls: list[int] = []
     real_fsync = journal.os.fsync
-    monkeypatch.setattr(
-        journal.os, "fsync", lambda fd: (calls.append(fd), real_fsync(fd))[1]
-    )
+
+    def spy(fd: int) -> None:
+        calls.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(journal.os, "fsync", spy)
 
     lg = ledger(tmp_path)
     order = intent()
@@ -646,7 +649,9 @@ def test_infinity_becomes_the_string_inf_rather_than_null(tmp_path: Path) -> Non
     assert journal.to_jsonable(float("inf")) == "inf"
     assert journal.to_jsonable(float("-inf")) == "-inf"
     assert journal.to_jsonable(float("nan")) is None
-    assert math.isinf(TxnCounts(buys=41, sells=0).ratio)
+    ratio = TxnCounts(buys=41, sells=0).ratio
+    assert ratio is not None
+    assert math.isinf(ratio)
 
     lg = ledger(tmp_path)
     lg.append_note(note_id="n", ts=NOW, text="x")

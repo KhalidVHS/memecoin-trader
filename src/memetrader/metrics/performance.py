@@ -36,15 +36,18 @@ the analyst can see median/worst-fold behaviour rather than just the aggregate.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
-from typing import Sequence
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 import numpy as np
 
 from memetrader.types import (
-    FidelityTier, Fill, NON_EXECUTABLE_NOTICE, OrderState, Side, finite
+    NON_EXECUTABLE_NOTICE,
+    FidelityTier,
+    Fill,
+    OrderState,
+    Side,
 )
-
 
 # ---------------------------------------------------------------------------
 # Output types
@@ -170,8 +173,7 @@ def _period_returns(equity: Sequence[float]) -> np.ndarray:
     # Avoid divide-by-zero: a zero equity value cannot produce a meaningful
     # return; treat as 0.0 rather than inf or nan.
     with np.errstate(invalid="ignore", divide="ignore"):
-        rets = np.where(prev > 0.0, (arr[1:] - prev) / prev, 0.0)
-    return rets
+        return np.where(prev > 0.0, (arr[1:] - prev) / prev, 0.0)
 
 
 def _sharpe(
@@ -223,9 +225,7 @@ def _sortino(
     return float(mean_excess / downside_std * math.sqrt(periods_per_year))
 
 
-def _annualized_return(
-    equity: Sequence[float], periods_per_year: float
-) -> float:
+def _annualized_return(equity: Sequence[float], periods_per_year: float) -> float:
     """Annualised arithmetic return expressed as a percentage.
 
     Uses the geometric compounding formula so that a 100% gain followed by a
@@ -276,7 +276,7 @@ def _trade_stats(
 
     # Build per-symbol open-time stack from BUY fills
     open_ts: dict[str, list[float]] = {}
-    for f in sorted(fills, key=lambda x: x.ts):  # noqa: E731
+    for f in sorted(fills, key=lambda x: x.ts):
         if f.state is not OrderState.LANDED:
             continue
         sym = f.symbol
@@ -363,9 +363,7 @@ def _fold_metrics(
     arr = list(equity)
     ids = list(fold_ids)
     if len(arr) != len(ids):
-        raise ValueError(
-            f"equity length {len(arr)} != fold_ids length {len(ids)}"
-        )
+        raise ValueError(f"equity length {len(arr)} != fold_ids length {len(ids)}")
 
     # Group indices by fold
     fold_indices: dict[int, list[int]] = {}

@@ -33,13 +33,12 @@ from __future__ import annotations
 
 import gzip
 import hashlib
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..backfill import SeriesMeta, read_manifest, read_series, series_path
-from ..types import Timeframe
+from memetrader.backfill import SeriesMeta, read_manifest, read_series, series_path
+from memetrader.types import Timeframe
 
 if TYPE_CHECKING:
     pass
@@ -296,8 +295,8 @@ def scan_parquet_partition(path: Path) -> dict[str, object]:
         col = tbl.column("event_time")
         return {
             "row_count": tbl.num_rows,
-            "first_ts": float(col.min().as_py()),  # type: ignore[union-attr]
-            "last_ts": float(col.max().as_py()),  # type: ignore[union-attr]
+            "first_ts": float(col.min().as_py()),
+            "last_ts": float(col.max().as_py()),
         }
     except Exception:  # noqa: BLE001
         return {"row_count": 0, "first_ts": None, "last_ts": None}

@@ -6,7 +6,6 @@ Every test must fail if the guard it exercises is removed.
 
 from __future__ import annotations
 
-import tomllib
 from pathlib import Path
 
 import pytest
@@ -19,7 +18,6 @@ from memetrader.backtest.config import (
     load,
 )
 from memetrader.types import ExecutionMode, FidelityTier
-
 
 # ---------------------------------------------------------------------------
 # Minimal valid config helpers
@@ -75,8 +73,15 @@ multipliers = [1, 2, 3]
 """
 
 
-def _write_toml(tmp_path: Path, content: str) -> Path:
-    p = tmp_path / "test.toml"
+def _write_toml(tmp_path: Path, content: str, name: str = "test.toml") -> Path:
+    """Write ``content`` to ``name`` inside the directory ``tmp_path``.
+
+    ``tmp_path`` must be a directory.  Callers needing a second config in the
+    same test pass a distinct ``name`` rather than a nested path — joining a
+    file path here would produce ``b.toml/test.toml``, whose parent does not
+    exist, and the resulting failure is a confusing one to read.
+    """
+    p = tmp_path / name
     p.write_text(content, encoding="utf-8")
     return p
 
@@ -153,7 +158,7 @@ def test_config_hash_changes_when_field_changes(tmp_path: Path) -> None:
     modified = _MINIMAL_TOML.replace(
         "starting_cash_usd = 500.0", "starting_cash_usd = 1000.0"
     )
-    cfg2 = load(_write_toml(tmp_path / "b.toml", modified))
+    cfg2 = load(_write_toml(tmp_path, modified, name="b.toml"))
     assert cfg1.config_hash != cfg2.config_hash
 
 

@@ -41,7 +41,6 @@ from __future__ import annotations
 
 import math
 
-
 # ---------------------------------------------------------------------------
 # Reason constants
 # ---------------------------------------------------------------------------
@@ -249,7 +248,7 @@ def smart_wallet_labels(
     # Score each wallet.
     sorted_returns = sorted(price_returns.items())
     return_times = [t for t, _ in sorted_returns]
-    return_vals = {t: r for t, r in sorted_returns}
+    return_vals = dict(sorted_returns)
 
     smart: set[str] = set()
     for wallet, trades in wallet_trades.items():

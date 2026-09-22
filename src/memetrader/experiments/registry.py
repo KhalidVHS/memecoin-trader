@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from memetrader.journal import ENCODING, append, scan
+from memetrader.journal import append, scan
 
 __all__ = [
     "Actor",
@@ -76,7 +76,7 @@ class HoldoutAccessError(RuntimeError):
     """
 
 
-class PermissionError(RuntimeError):  # noqa: A001
+class PermissionError(RuntimeError):
     """Raised when an actor requests a view it is not permitted to make.
 
     The name shadows the builtin deliberately: this is a domain-level permission
@@ -395,8 +395,7 @@ class Registry:
         return sum(
             1
             for r in self._rows
-            if r.get("kind") == "trial"
-            and r.get("experiment_id") == experiment_id
+            if r.get("kind") == "trial" and r.get("experiment_id") == experiment_id
         )
 
     def lineage(self, trial_id: str) -> list[str]:
@@ -458,8 +457,7 @@ class Registry:
         holdout_open_count = sum(
             1
             for r in self._rows
-            if r.get("kind") == "holdout_opened"
-            and r.get("experiment_id") == experiment_id
+            if r.get("kind") == "holdout_opened" and r.get("experiment_id") == experiment_id
         )
         holdout_opened = holdout_open_count > 0
 
@@ -508,7 +506,10 @@ class Registry:
 
     def _holdout_open_ts(self, experiment_id: str) -> float | None:
         for r in self._rows:
-            if r.get("kind") == "holdout_opened" and r.get("experiment_id") == experiment_id:
+            if (
+                r.get("kind") == "holdout_opened"
+                and r.get("experiment_id") == experiment_id
+            ):
                 ts = r.get("ts")
                 return float(ts) if ts is not None else None
         return None
@@ -524,5 +525,3 @@ class Registry:
         result = scan(self.path)
         self._rows = list(result.rows)
         self._seen = {r["row_id"] for r in self._rows if isinstance(r.get("row_id"), str)}
-
-

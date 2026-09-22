@@ -54,8 +54,6 @@ test_seconds    = 2_592_000   # 30 days
 roll_seconds    = 2_592_000   # 30 days
 embargo_seconds = 172_800     # 2 days: max holding period + publication lag
 n_outer_folds   = 3
-
-[folds]
 holdout_seconds  = 3_888_000  # 45 days — below the plan's 90-day recommendation
 holdout_min_pct  = 0.20       # at least 20 % of the record
 

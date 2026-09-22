@@ -56,7 +56,7 @@ T0 = 1_760_000_400.0
 DATE_STR = "2025-10-09"  # matches T0 UTC date
 
 
-def _token_search_response(mint: str, decimals: int = 5) -> dict[str, Any]:
+def _token_search_response(mint: str, decimals: int = 5) -> list[dict[str, Any]]:
     """Minimal /tokens/v2/search response for a given mint."""
     return [{"id": mint, "decimals": decimals, "symbol": "BONK"}]
 
@@ -409,11 +409,9 @@ def test_rung_error_does_not_discard_other_rungs(
     it as a fatal error would discard the other good rungs, making the cost
     curve unusable for the sizes that did succeed.
     """
-    # Track which (side, amount) pairs have been called so we can permanently
-    # fail the 50 USD rung regardless of how many retry attempts it makes.
-    seen_amounts: set[int] = set()
+    # The 50 USD rung fails permanently, on every retry attempt.
     # 50 USD = 50_000_000 micro-USDC (USDC has 6 decimals)
-    FAIL_AMOUNT = 50_000_000
+    fail_amount = 50_000_000
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
@@ -424,7 +422,7 @@ def test_rung_error_does_not_discard_other_rungs(
             in_amount = int(params.get("amount", "1000000"))
             # Permanently fail the 50 USD rung on all attempts (including
             # retries). 404 is non-retryable so a single response is enough.
-            if in_amount == FAIL_AMOUNT:
+            if in_amount == fail_amount:
                 return httpx.Response(404, json={"error": "not found"})
             return httpx.Response(200, json=_quote_response(in_amount, 500_000))
         return httpx.Response(404)
@@ -447,7 +445,7 @@ def test_rung_error_does_not_discard_other_rungs(
     assert SYMBOL in report.written
 
     shadow_dir = tmp_root / "shadow"
-    date_str = list(shadow_dir.iterdir())[0].name
+    date_str = next(iter(shadow_dir.iterdir())).name
     path = ladder_path(tmp_root, date_str, SYMBOL)
     snaps = _read_snapshots(path)
     assert len(snaps) == 1, "snapshot must be written even when one rung fails"
@@ -525,9 +523,9 @@ def test_one_coin_failing_does_not_abort_other_coins(
     must not prevent the next coin from being collected. One bad coin is filed
     under ``report.failed``; the rest continue.
     """
-    MINT2 = "UNKNOWN_MINT_XYZ"
-    SYMBOL2 = "UNKNOWN"
-    coins = [{"symbol": SYMBOL, "mint": MINT}, {"symbol": SYMBOL2, "mint": MINT2}]
+    mint2 = "UNKNOWN_MINT_XYZ"
+    symbol2 = "UNKNOWN"
+    coins = [{"symbol": SYMBOL, "mint": MINT}, {"symbol": symbol2, "mint": mint2}]
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
@@ -560,7 +558,7 @@ def test_one_coin_failing_does_not_abort_other_coins(
     assert SYMBOL in report.written
     # UNKNOWN should appear in failed (no verified decimals).
     failed_syms = [sym for sym, _ in report.failed]
-    assert SYMBOL2 in failed_syms
+    assert symbol2 in failed_syms
 
 
 # ---------------------------------------------------------------------------

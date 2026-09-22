@@ -8,11 +8,43 @@ stray ``time.time()`` call anywhere in the call graph breaks that guarantee
 silently — the equity curve still looks like an equity curve, but it cannot
 be reproduced.
 
-The guard is enforced at the module level by monkey-patching ``time.time`` and
-``datetime.now`` to raise when a ``SimulatedClock`` is active.  The patch is
-re-entrant (a second ``SimulatedClock`` while one is already active raises
-immediately) and is undone by ``SimulatedClock.close()``, which is why the
-clock implements the context-manager protocol.
+The guard is enforced at the module level by monkey-patching ``time.time``
+and ``time.time_ns`` (module-attribute assignment, which is legal because
+``time`` is an ordinary module) to raise when a ``SimulatedClock`` is active.
+``time.monotonic``/``time.perf_counter`` are deliberately left unguarded —
+they measure durations, not wall-clock instants, and guarding them would
+break timing/profiling code that is harmlessly used inside a replay without
+buying any determinism.
+
+``datetime.datetime`` cannot be patched the same way: ``datetime`` is an
+immutable C type, and assigning to ``datetime.now`` raises
+``TypeError: cannot set 'now' attribute of immutable type 'datetime.datetime'``.
+Instead we rebind the *class* in the ``datetime`` module's namespace to a
+subclass whose ``now``/``utcnow`` raise, and restore the original class on
+close.
+
+.. important:: **Documented gap.** The subclass swap only catches call sites
+   that do ``import datetime`` and then call ``datetime.datetime.now(...)``
+   (or a module that imports ``memetrader.backtest.clock`` after this module
+   has already rebound the name). It does **not** catch
+   ``from datetime import datetime`` performed *before* the guard is
+   installed, because that import binds the name directly to the original
+   class object, and rebinding ``datetime.datetime`` afterwards does not
+   change an already-bound local/module name elsewhere. Guard against this
+   gap statically: ``tests/backtest/test_clock.py`` scans
+   ``src/memetrader/**/*.py`` for direct ``datetime.now(``/``datetime.utcnow(``
+   call sites and fails the build if one appears outside an explicit
+   allowlist — this converts the unenforceable runtime gap into an
+   enforceable static one.
+
+Both guards are installed by ``SimulatedClock.__enter__`` under a single
+exception-safe sequence: if any step of installing the guard fails, every
+already-applied patch is unwound, ``_active_clock`` is reset to ``None``, and
+the original exception is re-raised. A partially-applied guard — the bug that
+motivated this design — is impossible by construction: either every patch is
+applied and ``_active_clock`` is set, or none are and it is ``None``. The
+guard is undone by ``SimulatedClock.close()``, which is why the clock
+implements the context-manager protocol.
 
 ``deterministic_seed`` lives here rather than in a utilities module because it
 is tightly coupled to the clock's ``run_id`` — seeds that are not bound to the
@@ -27,11 +59,12 @@ ID plus its own name, keeps streams orthogonal.
 
 from __future__ import annotations
 
+import datetime as _datetime_module
 import hashlib
 import math
 import time
 import types as _types
-from datetime import datetime, timezone
+from typing import NoReturn
 
 
 class ClockError(RuntimeError):
@@ -55,15 +88,39 @@ class WallClockAccessError(ClockError):
 # Wall-clock guard
 # ---------------------------------------------------------------------------
 
-# We replace ``time.time`` and ``datetime.now`` with guards that raise when a
-# SimulatedClock is active.  The originals are stashed here so ``close()``
-# can restore them.  Using module-level state rather than instance state means
-# the guard is process-wide, which is what we need: a replayed strategy that
-# reads the clock via an import alias still triggers the error.
+# We replace ``time.time``, ``time.time_ns``, and the ``datetime.datetime``
+# class with guards that raise when a SimulatedClock is active.  The
+# originals are stashed here so ``close()`` (and the exception-safe unwind in
+# ``__enter__``) can restore them.  Using module-level state rather than
+# instance state means the guard is process-wide, which is what we need: a
+# replayed strategy that reads the clock via an import alias still triggers
+# the error.
+#
+# ``time.monotonic`` and ``time.perf_counter`` are NOT guarded. They measure
+# elapsed durations, not wall-clock instants, so reading them during a replay
+# does not make the economic output non-deterministic — it is safe (and
+# common) for profiling/timing code to call them inside a replay.
 
 _orig_time_time = time.time
-_orig_datetime_now = datetime.now
+_orig_time_time_ns = time.time_ns
+_orig_datetime_class = _datetime_module.datetime
 _active_clock: SimulatedClock | None = None
+
+
+def active_clock() -> SimulatedClock | None:
+    """Return the clock currently driving a replay, or ``None`` if live.
+
+    This is the supported way for code outside this module to ask "am I inside
+    a replay?".  Reading the private ``_active_clock`` global directly works
+    today but couples callers to an implementation detail that the guard
+    install/unwind logic owns.
+
+    The motivating caller is :mod:`memetrader.ids`, which mints identifiers
+    from the wall clock when live and must mint them from simulated time when
+    replaying — it cannot simply call ``time.time()``, because the guard this
+    module installs makes that raise.
+    """
+    return _active_clock
 
 
 def _guarded_time() -> float:
@@ -75,11 +132,34 @@ def _guarded_time() -> float:
     )
 
 
-def _guarded_datetime_now(tz: timezone | None = None) -> datetime:  # noqa: ARG001
+def _guarded_time_ns() -> int:
     raise WallClockAccessError(
-        "datetime.now() called during a replay — read the SimulatedClock instead. "
+        "time.time_ns() called during a replay — read the SimulatedClock instead. "
         "See time.time() guard for the rationale."
     )
+
+
+class _GuardedDatetime(_orig_datetime_class):
+    """``datetime.datetime`` subclass whose ``now``/``utcnow`` raise.
+
+    Swapped in for the real class while a ``SimulatedClock`` is active (see
+    the module docstring for why a subclass swap is used instead of patching
+    ``datetime.now`` directly, and for the documented gap this leaves).
+    """
+
+    @classmethod
+    def now(cls, tz: _datetime_module.tzinfo | None = None) -> NoReturn:
+        raise WallClockAccessError(
+            "datetime.now() called during a replay — read the SimulatedClock instead. "
+            "See time.time() guard for the rationale."
+        )
+
+    @classmethod
+    def utcnow(cls) -> NoReturn:
+        raise WallClockAccessError(
+            "datetime.utcnow() called during a replay — read the SimulatedClock instead. "
+            "See time.time() guard for the rationale."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +254,7 @@ class SimulatedClock:
     # ------------------------------------------------------------------
 
     def __enter__(self) -> SimulatedClock:
-        global _active_clock  # noqa: PLW0603
+        global _active_clock
         if _active_clock is not None:
             raise ClockError(
                 f"A SimulatedClock (run_id={_active_clock.run_id!r}) is already "
@@ -182,9 +262,28 @@ class SimulatedClock:
                 "are not supported: the wall-clock guard is process-wide and "
                 "cannot be shared between two independent replay sessions."
             )
+        # Install every patch, but if any step fails, unwind whatever was
+        # already applied and reset _active_clock before re-raising.  A
+        # partially-applied guard must be impossible: either every patch is
+        # active and _active_clock is self, or none are and it is None.
         _active_clock = self
-        time.time = _guarded_time  # type: ignore[assignment]
-        datetime.now = _guarded_datetime_now  # type: ignore[assignment]
+        applied: list[str] = []
+        try:
+            time.time = _guarded_time
+            applied.append("time")
+            time.time_ns = _guarded_time_ns
+            applied.append("time_ns")
+            setattr(_datetime_module, "datetime", _GuardedDatetime)  # noqa: B010
+            applied.append("datetime")
+        except BaseException:
+            if "datetime" in applied:
+                setattr(_datetime_module, "datetime", _orig_datetime_class)  # noqa: B010
+            if "time_ns" in applied:
+                time.time_ns = _orig_time_time_ns
+            if "time" in applied:
+                time.time = _orig_time_time
+            _active_clock = None
+            raise
         return self
 
     def __exit__(
@@ -200,10 +299,11 @@ class SimulatedClock:
 
         Safe to call more than once; subsequent calls are no-ops.
         """
-        global _active_clock  # noqa: PLW0603
+        global _active_clock
         if _active_clock is self:
-            time.time = _orig_time_time  # type: ignore[assignment]
-            datetime.now = _orig_datetime_now  # type: ignore[assignment]
+            time.time = _orig_time_time
+            time.time_ns = _orig_time_time_ns
+            setattr(_datetime_module, "datetime", _orig_datetime_class)  # noqa: B010
             _active_clock = None
 
 

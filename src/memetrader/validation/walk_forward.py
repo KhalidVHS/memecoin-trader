@@ -45,7 +45,7 @@ ABC). The user supplies:
 
     ``test_fn(model, test_view, fold_record) -> FoldMetrics``
         Called with the guarded test view. Called exactly once per fold.
-        The guarded view raises ``TestSetAccessViolation`` on a second read.
+        The guarded view raises ``EvaluationAccessViolation`` on a second read.
 
 Thread safety
 -------------
@@ -58,8 +58,9 @@ sequentially.
 from __future__ import annotations
 
 import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol, Sequence
+from typing import Any, Protocol
 
 from memetrader.validation.splits import (
     FoldRecord,
@@ -73,7 +74,7 @@ from memetrader.validation.splits import (
 # ---------------------------------------------------------------------------
 
 
-class TestSetAccessViolation(RuntimeError):
+class EvaluationAccessViolation(RuntimeError):
     """Raised when a test fold is read more than once in the same fold.
 
     The structural invariant: the test fold is evaluated exactly once. A second
@@ -81,8 +82,13 @@ class TestSetAccessViolation(RuntimeError):
     model, which is the definition of test-set contamination. We raise rather
     than warn because a contaminated result is worse than no result.
 
-    Named ``TestSetAccessViolation`` (not ``TestAccessViolation``) to avoid
-    pytest treating it as a test class during collection.
+    Named ``EvaluationAccessViolation`` rather than anything starting with
+    ``Test`` (e.g. ``TestAccessViolation`` or ``TestSetAccessViolation``)
+    because pytest's default ``python_classes`` pattern collects *any*
+    module-level class named ``Test*`` as a candidate test class. That would
+    make pytest try to collect this exception as a test class during import,
+    which is exactly the kind of noise (``PytestCollectionWarning``) a clean
+    test run should not have to filter through.
     """
 
 
@@ -100,8 +106,9 @@ class _GuardedTestView:
     """A read-once wrapper around the test observations for one fold.
 
     ``_accessed`` is set on the first ``read()`` call. A second call raises
-    ``TestSetAccessViolation``. The driver hands this wrapper (not the raw list)
-    to ``test_fn``, so the callable cannot accidentally re-read the test set.
+    ``EvaluationAccessViolation``. The driver hands this wrapper (not the raw
+    list) to ``test_fn``, so the callable cannot accidentally re-read the test
+    set.
 
     ``access_count`` is public so a post-hoc leakage audit can assert:
         assert all(r.test_view.access_count == 1 for r in results)
@@ -127,7 +134,7 @@ class _GuardedTestView:
         result produced after a test-set read cannot be trusted.
         """
         if self._access_count > 0:
-            raise TestSetAccessViolation(
+            raise EvaluationAccessViolation(
                 f"Fold '{self._fold_id}': test observations were already read "
                 f"({self._access_count} time(s)). Reading the test set more than once "
                 "means test-set feedback has contaminated the model selection or "
@@ -255,8 +262,15 @@ class RefitCallable(Protocol):
     ) -> Any: ...
 
 
-class TestCallable(Protocol):
-    """Protocol for the test phase: reads the guarded test view once."""
+class EvaluationCallable(Protocol):
+    """Protocol for the test phase: reads the guarded test view once.
+
+    Named ``EvaluationCallable`` (not ``TestCallable``) for the same reason
+    ``EvaluationAccessViolation`` is not named ``TestAccessViolation``: pytest
+    collects any module-level class matching ``Test*`` as a candidate test
+    class, which is unwanted noise for a protocol that is never meant to be
+    run as a test.
+    """
 
     def __call__(
         self,
@@ -295,7 +309,7 @@ class WalkForwardRunner:
     fit_fn: FitCallable
     select_fn: SelectCallable
     refit_fn: RefitCallable
-    test_fn: TestCallable
+    test_fn: EvaluationCallable
     enable_purge: bool = True
 
     def run(
@@ -412,12 +426,12 @@ class WalkForwardRunner:
 # ---------------------------------------------------------------------------
 
 __all__ = [
+    "EvaluationAccessViolation",
+    "EvaluationCallable",
     "FitCallable",
     "FoldResult",
     "RefitCallable",
     "SelectCallable",
-    "TestSetAccessViolation",
-    "TestCallable",
     "WalkForwardError",
     "WalkForwardRunResult",
     "WalkForwardRunner",

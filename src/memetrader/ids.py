@@ -29,6 +29,7 @@ import os
 import time
 
 __all__ = [
+    "ids_state",
     "new_action_id",
     "new_decision_id",
     "new_fill_id",
@@ -36,10 +37,105 @@ __all__ = [
     "new_order_id",
     "new_run_id",
     "quote_fingerprint",
+    "restore_ids_state",
 ]
+
+# ---------------------------------------------------------------------------
+# Replay-aware minting
+# ---------------------------------------------------------------------------
+#
+# Live, both halves of an ID come from the environment: the timestamp from
+# ``time.time()`` and the suffix from ``os.urandom``.  Under replay neither is
+# usable.  ``time.time()`` *raises* while a SimulatedClock is active (that is
+# the whole point of its wall-clock guard), and ``os.urandom`` would make two
+# replays of the same data produce different IDs — breaking the deterministic
+# replay invariant in BACKTEST-CONTRACTS.md §6, which requires two runs over
+# identical inputs to be comparable record by record.
+#
+# So under replay we substitute both: simulated time for the timestamp, and a
+# per-run monotonic counter for the suffix.  The counter is what keeps IDs
+# unique when several intents are minted inside a single simulated instant,
+# which is the common case — a tick emits all its orders at one ``now``.
+#
+# The counter resets when the active clock instance changes, so two runs in
+# one process each start from zero and produce identical ID sequences.  It is
+# exposed via ids_state()/restore_ids_state() so a crash-restart snapshot can
+# carry it across a resume; without that, a resumed run would restart the
+# counter and re-issue IDs it had already used.
+
+_sim_clock: object | None = None
+_sim_seq: int = 0
+
+
+def ids_state() -> dict[str, object]:
+    """Capture the replay ID counter, for inclusion in a restart snapshot.
+
+    Returns ``{}`` when no replay is active, because there is nothing to carry
+    — live IDs are environment-derived and do not need to be resumed.
+    """
+    from memetrader.backtest.clock import active_clock
+
+    # Ask the clock, not our own ``_sim_clock``: that global holds the last
+    # replay we minted under and is deliberately not cleared on clock exit, so
+    # consulting it here would report a finished replay's counter as live state.
+    clock = active_clock()
+    if clock is None:
+        return {}
+    return {"run_id": clock.run_id, "seq": _sim_seq if clock is _sim_clock else 0}
+
+
+def restore_ids_state(state: dict[str, object]) -> None:
+    """Restore a counter captured by :func:`ids_state`.
+
+    Must be called *after* the SimulatedClock is active: the restore binds
+    itself to the clock that is running, so the next mint continues the
+    sequence instead of treating a fresh clock instance as a fresh run and
+    resetting to zero.
+    """
+    global _sim_clock, _sim_seq
+    from memetrader.backtest.clock import active_clock
+
+    seq = state.get("seq", 0)
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+        raise ValueError(f"ids state 'seq' must be a non-negative int, got {seq!r}")
+    clock = active_clock()
+    if clock is None:
+        raise RuntimeError(
+            "restore_ids_state() requires an active SimulatedClock — restoring "
+            "with no replay running would be silently discarded by the next mint."
+        )
+    _sim_clock = clock
+    _sim_seq = seq
+
+
+def _next_sim_seq(clock: object) -> int:
+    global _sim_clock, _sim_seq
+    if clock is not _sim_clock:
+        # A different replay: start its ID sequence from zero so the run is
+        # reproducible regardless of what ran before it in this process.
+        _sim_clock = clock
+        _sim_seq = 0
+    seq = _sim_seq
+    _sim_seq = seq + 1
+    return seq
 
 
 def _mint(prefix: str) -> str:
+    # Imported lazily: ids.py sits below the backtest package, and importing it
+    # at module scope would invert that layering for the benefit of a branch
+    # that only matters during replay.
+    from memetrader.backtest.clock import active_clock
+
+    clock = active_clock()
+    if clock is not None:
+        seq = _next_sim_seq(clock)
+        micros = int(clock.now * 1_000_000)
+        # blake2b, not urandom: the suffix must be a deterministic function of
+        # (run, prefix, sequence) so the same replay mints the same IDs twice.
+        key = f"{clock.run_id}|{prefix}|{seq}"
+        suffix = hashlib.blake2b(key.encode("utf-8"), digest_size=4).hexdigest()
+        return f"{prefix}-{micros:018d}-{suffix}"
+
     # Microseconds, not seconds: a slow tick can emit several intents inside one
     # second and they must still sort in the order they were created.
     micros = int(time.time() * 1_000_000)

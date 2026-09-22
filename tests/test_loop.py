@@ -17,11 +17,14 @@ from __future__ import annotations
 import dataclasses
 import math
 from pathlib import Path
+from typing import cast
 
+import httpx
 import pytest
 
 from memetrader import config as config_mod
 from memetrader import ids, loop, quotes, risk
+from memetrader.broker import LocalPaperBroker
 from memetrader.ids import quote_fingerprint
 from memetrader.types import (
     CoinSnapshot as Snap,
@@ -31,6 +34,7 @@ from memetrader.types import (
     EvidenceBundle,
     ExecutionMode,
     Fill,
+    FlowBrief,
     Mark,
     OrderIntent,
     OrderState,
@@ -43,6 +47,7 @@ from memetrader.types import (
     TargetPosition,
     TechnicalBrief,
     Technicals,
+    Timeframe,
     TokenMeta,
     TxnCounts,
 )
@@ -238,12 +243,37 @@ def _technicals(*, realized_vol_pct: float | None = 45.0) -> TechnicalBrief:
     fields = {
         f.name: None
         for f in dataclasses.fields(Technicals)
-        if f.name not in {"timeframe", "candles_used", "realized_vol_pct"}
+        if f.name not in {"timeframe", "candles_used", "pool_address", "realized_vol_pct"}
     }
-    h1 = Technicals(
-        timeframe="1h", candles_used=60, realized_vol_pct=realized_vol_pct, **fields
+    m5 = Technicals(
+        timeframe=Timeframe.M5,
+        candles_used=60,
+        pool_address="pool",
+        realized_vol_pct=realized_vol_pct,
+        **fields,
     )
-    return TechnicalBrief(symbol="BONK", m5=None, h1=h1, flow=None)
+    h1 = Technicals(
+        timeframe=Timeframe.H1,
+        candles_used=60,
+        pool_address="pool",
+        realized_vol_pct=realized_vol_pct,
+        **fields,
+    )
+    # FlowBrief is entirely optional fields; every one absent is itself a claim
+    # ("no data"), and the sizing tests below are not exercising this brief.
+    flow = FlowBrief(
+        txn_count_ratio_m5=None,
+        txn_count_ratio_h1=None,
+        txn_count_ratio_h24=None,
+        turnover_24h=None,
+        turnover_1h=None,
+        liquidity_usd=None,
+        liquidity_trend_pct=None,
+        liquidity_trend_seconds=None,
+        liquidity_trend_pool=None,
+        price_ladder=PriceLadder(m5=None, h1=None, h6=None, h24=None),
+    )
+    return TechnicalBrief(symbol="BONK", m5=m5, h1=h1, flow=flow)
 
 
 def _evidence(snap: MSnap, *, realized_vol_pct: float | None = 45.0):
@@ -256,6 +286,13 @@ def _evidence(snap: MSnap, *, realized_vol_pct: float | None = 45.0):
             sentiment_unavailable_reason="sentiment disabled",
         )
     }
+
+
+def _fake_client() -> httpx.Client:
+    # Never used: every network call in these tests is patched out. Cast rather
+    # than construct a real httpx.Client, which would open a connection pool
+    # this test has no use for.
+    return cast(httpx.Client, object())
 
 
 def _trader(
@@ -271,9 +308,9 @@ def _trader(
     broker = broker if broker is not None else FakeBroker(cfg)
     t = loop.Trader(
         cfg,
-        broker=broker,
+        broker=cast(LocalPaperBroker, broker),
         strategy_impl=FixedStrategy(targets),
-        client=object(),  # never used; every network call is patched out
+        client=_fake_client(),
         now=lambda: NOW,
     )
     if monkeypatch is not None:
@@ -647,7 +684,11 @@ def test_a_halted_run_does_not_call_the_strategy(cfg, monkeypatch):
     broker = FakeBroker(cfg)
     strategy = FixedStrategy((TargetPosition("BONK", 25.0),))
     t = loop.Trader(
-        cfg, broker=broker, strategy_impl=strategy, client=object(), now=lambda: NOW
+        cfg,
+        broker=cast(LocalPaperBroker, broker),
+        strategy_impl=strategy,
+        client=_fake_client(),
+        now=lambda: NOW,
     )
     monkeypatch.setattr(t, "snapshot", lambda **kw: _snapshot())
     monkeypatch.setattr(t, "token", lambda symbol, mint: TOKEN)
@@ -692,9 +733,9 @@ def test_a_strategy_exception_is_an_error_not_a_hold(cfg, monkeypatch):
 
     t = loop.Trader(
         cfg,
-        broker=FakeBroker(cfg),
+        broker=cast(LocalPaperBroker, FakeBroker(cfg)),
         strategy_impl=Exploding(()),
-        client=object(),
+        client=_fake_client(),
         now=lambda: NOW,
     )
     monkeypatch.setattr(t, "snapshot", lambda **kw: _snapshot())
@@ -713,7 +754,7 @@ def test_a_broker_refusal_does_not_stop_the_loop(cfg, monkeypatch):
     def refuse(intent, quote, *, now):
         raise loop.BrokerError("insufficient cash")
 
-    broker.place_order = refuse
+    monkeypatch.setattr(broker, "place_order", refuse)
     t = _trader(
         cfg, broker=broker, targets=(TargetPosition("BONK", 25.0),), monkeypatch=monkeypatch
     )
@@ -962,7 +1003,7 @@ def test_the_intent_is_journaled_before_the_order_is_placed(cfg, monkeypatch, tm
         return FakeBroker.place_order(broker, intent, quote, now=now)
 
     monkeypatch.setattr(t.ledger, "append_intent", spy_intent)
-    broker.place_order = spy_place
+    monkeypatch.setattr(broker, "place_order", spy_place)
     monkeypatch.setattr(
         quotes,
         "quote_buy_usd",

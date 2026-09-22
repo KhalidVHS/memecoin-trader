@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import anthropic
-import httpx
+import httpx2
 import pytest
 
 from memetrader import brain
@@ -44,7 +44,12 @@ from memetrader.brain import (
     advise,
 )
 from memetrader.types import AdvisoryAction, AdvisoryDecision, ValidationError
-from test_prompts import (  # reuse the evidence fixtures; same types, same shapes
+
+# Reuses the evidence fixtures from test_prompts; same types, same shapes. This
+# resolves at runtime because pytest's rootdir insertion puts tests/ on sys.path,
+# but tests/ isn't on mypy_path (mypy_path only names the source roots), so mypy
+# can't find the module — hence the ignore rather than a real missing dependency.
+from test_prompts import (  # type: ignore[import-not-found]
     SYMBOLS,
     FakeCadence,
     FakeRisk,
@@ -143,7 +148,7 @@ def run(client: FakeClient, **kw):
         "client": client,
     }
     params.update(kw)
-    return advise(_evidence(), _portfolio(), [], [], **params)  # type: ignore[arg-type]
+    return advise(_evidence(), _portfolio(), [], [], **params)
 
 
 # ---------------------------------------------------------------------------
@@ -270,24 +275,24 @@ class TestApiFailures:
         return caught.value
 
     def test_a_rate_limit_is_retryable(self):
-        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
-        response = httpx.Response(429, request=request)
+        request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+        response = httpx2.Response(429, request=request)
         error = self._raise(
             anthropic.RateLimitError("slow down", response=response, body=None)
         )
         assert error.retryable is True
 
     def test_a_500_is_retryable_and_a_400_is_not(self):
-        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
         for status, retryable in ((500, True), (400, False)):
-            response = httpx.Response(status, request=request)
+            response = httpx2.Response(status, request=request)
             error = self._raise(
                 anthropic.APIStatusError("boom", response=response, body=None)
             )
             assert error.retryable is retryable, status
 
     def test_a_connection_failure_is_retryable(self):
-        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
         error = self._raise(anthropic.APIConnectionError(request=request))
         assert error.retryable is True
 
@@ -298,8 +303,8 @@ class TestApiFailures:
         bad run, which is why this raises instead of returning something
         plausible.
         """
-        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
-        response = httpx.Response(503, request=request)
+        request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+        response = httpx2.Response(503, request=request)
         with pytest.raises(ModelCallError):
             run(
                 FakeClient(

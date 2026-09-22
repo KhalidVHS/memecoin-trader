@@ -12,12 +12,10 @@ import pytest
 
 from memetrader.execution.interfaces import ApprovedOrder, NoRoute
 from memetrader.types import (
-    OrderState,
     RiskBounds,
     Side,
     ValidationError,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures — minimal valid objects
@@ -107,7 +105,7 @@ class TestApprovedOrder:
         after risk approval, breaking the quote-binding guarantee (audit C3)."""
         order = _make_approved_order()
         with pytest.raises((AttributeError, TypeError)):
-            order.decided_at = 0.0  # type: ignore[misc]
+            order.decided_at = 0.0
 
     def test_negative_decided_at_raises(self):
         """A negative decided_at is a programming error, not a market condition."""

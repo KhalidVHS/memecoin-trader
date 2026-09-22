@@ -53,6 +53,12 @@ target-version = "py314"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
+# RUF001/2/3 exist to catch a homoglyph smuggled into an identifier or into a
+# string that is later compared for equality. These three are neither: they
+# appear only in prose about arithmetic, where `2 × fee` and `2018–2024` are
+# what the author meant and the ASCII substitutes (`x`, `-`) read as a variable
+# and as a minus sign. Allowing them keeps the rule sharp for the case it is for.
+allowed-confusables = ["×", "–", "−"]
 select = [
     "F",      # pyflakes — unused imports and names, undefined references
     "E", "W", # pycodestyle
@@ -82,6 +88,12 @@ ignore = [
     "N818",
     # `import sentiment as S` in test_sentiment.py, deliberate and local.
     "N812",
+    # Every site SIM108 flags is a two-branch choice where at least one branch
+    # carries the comment explaining *why* that value — the venue fee that is
+    # zero only because Jupiter already netted it, the tick boundary chosen by
+    # swap direction. Collapsing those into a ternary has nowhere to put the
+    # comment, so the rule trades the explanation for a line.
+    "SIM108",
 ]
 # Deliberately absent, each for a reason found in the code itself:
 #   PL   — PLR0124 flags journal.py's `obj != obj`, which *is* the NaN test, and
@@ -162,8 +174,9 @@ disallow_incomplete_defs = false
 disable_error_code = ["operator", "union-attr"]
 
 [[tool.mypy.overrides]]
-# Neither ships type information. pandas is used only inside signals.py, whose
-# own signatures are fully annotated at the boundary, so the untyped interior is
-# contained rather than leaking into the rest of the package.
-module = ["praw.*", "prawcore.*", "pandas.*"]
+# None of these ship type information. pandas is used only inside signals.py and
+# pyarrow only inside histdata/catalog.py, each behind fully annotated
+# signatures, so the untyped interior is contained rather than leaking into the
+# rest of the package.
+module = ["praw.*", "prawcore.*", "pandas.*", "pyarrow.*"]
 ignore_missing_imports = true

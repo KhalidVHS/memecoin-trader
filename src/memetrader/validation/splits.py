@@ -78,11 +78,9 @@ from __future__ import annotations
 
 import math
 import warnings
-from dataclasses import dataclass, field
+from collections.abc import Sequence
+from dataclasses import dataclass
 from itertools import combinations
-from typing import Iterator, Sequence
-
-import numpy as np
 
 # ---------------------------------------------------------------------------
 # Constants from the data horizon (documented in docs/CANNOT-REPLAY.md)

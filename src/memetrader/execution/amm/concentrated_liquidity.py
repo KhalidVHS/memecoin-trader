@@ -189,9 +189,7 @@ def tick_at_sqrt_price(sqrt_price_x64: int) -> int:
     ``sqrt_price_at_tick(i) <= sqrt_price_x64``.
     """
     if not isinstance(sqrt_price_x64, int) or isinstance(sqrt_price_x64, bool):
-        raise ValidationError(
-            f"sqrt_price_x64 must be int, got {sqrt_price_x64!r}"
-        )
+        raise ValidationError(f"sqrt_price_x64 must be int, got {sqrt_price_x64!r}")
     if sqrt_price_x64 <= 0:
         raise ValidationError(f"sqrt_price_x64 must be > 0, got {sqrt_price_x64}")
 
@@ -267,60 +265,61 @@ def _compute_amount_out_within_range(
             # gross_consumed = ceil(consumed_net / (1 - fee_bps/10000))
             fee_factor = 10_000 - fee_bps
             if fee_factor > 0:
-                gross_consumed = (amount_in_consumed_net * 10_000 + fee_factor - 1) // fee_factor
+                gross_consumed = (
+                    amount_in_consumed_net * 10_000 + fee_factor - 1
+                ) // fee_factor
             else:
                 gross_consumed = amount_in_consumed_net
             fee_charged = gross_consumed - amount_in_consumed_net
             # Δy = L * (sqrt_P_current - sqrt_P_target)
             out = int(liquidity * (sqrt_current - sqrt_target))
             return gross_consumed, out, fee_charged, sqrt_price_target_x64
-        else:
-            # Partial fill: amount_in_net moves the price partway.
-            # New sqrt_P: 1/sqrt_P_new = 1/sqrt_P_current + Δx_net/L
-            if amount_in_net == 0:
-                # All input consumed by fees; price does not move.
-                return amount_in_remaining, 0, fee, sqrt_price_current_x64
-            inv_new = 1.0 / sqrt_current + amount_in_net / liquidity
-            if inv_new <= 0.0:
-                return 0, 0, 0, sqrt_price_current_x64
-            sqrt_new = 1.0 / inv_new
-            # Clamp to not exceed current (direction=True means price falls).
-            sqrt_price_new_x64 = min(int(sqrt_new * _Q64), sqrt_price_current_x64)
-            out = max(0, int(liquidity * (sqrt_current - sqrt_new)))
-            return amount_in_remaining, out, fee, sqrt_price_new_x64
-    else:
-        # Selling token_1 (y), buying token_0 (x). Price moves up.
-        sqrt_current = sqrt_price_current_x64 / _Q64
-        sqrt_target = sqrt_price_target_x64 / _Q64
-
-        if sqrt_current <= 0.0 or sqrt_target <= 0.0:
+        # Partial fill: amount_in_net moves the price partway.
+        # New sqrt_P: 1/sqrt_P_new = 1/sqrt_P_current + Δx_net/L
+        if amount_in_net == 0:
+            # All input consumed by fees; price does not move.
+            return amount_in_remaining, 0, fee, sqrt_price_current_x64
+        inv_new = 1.0 / sqrt_current + amount_in_net / liquidity
+        if inv_new <= 0.0:
             return 0, 0, 0, sqrt_price_current_x64
+        sqrt_new = 1.0 / inv_new
+        # Clamp to not exceed current (direction=True means price falls).
+        sqrt_price_new_x64 = min(int(sqrt_new * _Q64), sqrt_price_current_x64)
+        out = max(0, int(liquidity * (sqrt_current - sqrt_new)))
+        return amount_in_remaining, out, fee, sqrt_price_new_x64
+    # Selling token_1 (y), buying token_0 (x). Price moves up.
+    sqrt_current = sqrt_price_current_x64 / _Q64
+    sqrt_target = sqrt_price_target_x64 / _Q64
 
-        # Max input (token_1) to consume this entire range:
-        # Δy_max = L * (sqrt_P_target - sqrt_P_current)
-        max_amount_in_net = int(liquidity * (sqrt_target - sqrt_current))
+    if sqrt_current <= 0.0 or sqrt_target <= 0.0:
+        return 0, 0, 0, sqrt_price_current_x64
 
-        if amount_in_net >= max_amount_in_net:
-            amount_in_consumed_net = max_amount_in_net
-            fee_factor = 10_000 - fee_bps
-            if fee_factor > 0:
-                gross_consumed = (amount_in_consumed_net * 10_000 + fee_factor - 1) // fee_factor
-            else:
-                gross_consumed = amount_in_consumed_net
-            fee_charged = gross_consumed - amount_in_consumed_net
-            # Δx = L * (1/sqrt_P_current - 1/sqrt_P_target)
-            out = int(liquidity * (1.0 / sqrt_current - 1.0 / sqrt_target))
-            return gross_consumed, out, fee_charged, sqrt_price_target_x64
+    # Max input (token_1) to consume this entire range:
+    # Δy_max = L * (sqrt_P_target - sqrt_P_current)
+    max_amount_in_net = int(liquidity * (sqrt_target - sqrt_current))
+
+    if amount_in_net >= max_amount_in_net:
+        amount_in_consumed_net = max_amount_in_net
+        fee_factor = 10_000 - fee_bps
+        if fee_factor > 0:
+            gross_consumed = (
+                amount_in_consumed_net * 10_000 + fee_factor - 1
+            ) // fee_factor
         else:
-            # Partial fill: amount_in_net raises price by Δy_net/L
-            if amount_in_net == 0:
-                # All input consumed by fees; price does not move.
-                return amount_in_remaining, 0, fee, sqrt_price_current_x64
-            sqrt_new = sqrt_current + amount_in_net / liquidity
-            # Clamp to not exceed target (direction=False means price rises).
-            sqrt_price_new_x64 = max(int(sqrt_new * _Q64), sqrt_price_current_x64)
-            out = max(0, int(liquidity * (1.0 / sqrt_current - 1.0 / sqrt_new)))
-            return amount_in_remaining, out, fee, sqrt_price_new_x64
+            gross_consumed = amount_in_consumed_net
+        fee_charged = gross_consumed - amount_in_consumed_net
+        # Δx = L * (1/sqrt_P_current - 1/sqrt_P_target)
+        out = int(liquidity * (1.0 / sqrt_current - 1.0 / sqrt_target))
+        return gross_consumed, out, fee_charged, sqrt_price_target_x64
+    # Partial fill: amount_in_net raises price by Δy_net/L
+    if amount_in_net == 0:
+        # All input consumed by fees; price does not move.
+        return amount_in_remaining, 0, fee, sqrt_price_current_x64
+    sqrt_new = sqrt_current + amount_in_net / liquidity
+    # Clamp to not exceed target (direction=False means price rises).
+    sqrt_price_new_x64 = max(int(sqrt_new * _Q64), sqrt_price_current_x64)
+    out = max(0, int(liquidity * (1.0 / sqrt_current - 1.0 / sqrt_new)))
+    return amount_in_remaining, out, fee, sqrt_price_new_x64
 
 
 def swap(

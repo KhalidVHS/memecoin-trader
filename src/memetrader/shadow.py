@@ -97,7 +97,7 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import httpx
 
@@ -110,6 +110,9 @@ from .quotes import (
     usd_to_atomic,
 )
 from .types import Quote, Side, TokenMeta, ValidationError
+
+if TYPE_CHECKING:
+    from .config import Config
 
 __all__ = [
     "DEFAULT_LADDER_USD",
@@ -417,7 +420,7 @@ def read_manifest(root: Path, date_str: str) -> list[ShadowMeta]:
             if "sides" in kwargs:
                 kwargs["sides"] = tuple(str(s) for s in kwargs["sides"])
             out.append(ShadowMeta(**kwargs))
-        except (KeyError, TypeError, ValueError):
+        except KeyError, TypeError, ValueError:
             # A corrupt or future-schema entry is skipped, not fatal. The
             # collector will re-collect it.
             continue
@@ -792,9 +795,7 @@ def collect(
     # Compute the UTC date string for today's directory.
     import datetime
 
-    date_str = datetime.datetime.fromtimestamp(now(), tz=datetime.UTC).strftime(
-        "%Y-%m-%d"
-    )
+    date_str = datetime.datetime.fromtimestamp(now(), tz=datetime.UTC).strftime("%Y-%m-%d")
 
     # Build HTTP headers (carries api key when present).
     # We need the headers dict the same way quotes.py builds it. Since we
@@ -847,8 +848,11 @@ def collect(
                 tmeta = token_meta(
                     # token_meta takes a Config object; we duck-type the minimal
                     # interface it needs: cfg.data.jupiter_url_base and
-                    # cfg.data.jupiter_api_key. Build a minimal namespace.
-                    _MinimalCfg(jupiter_base, jupiter_api_key),
+                    # cfg.data.jupiter_api_key. The cast is the honest shape of
+                    # that: structurally this satisfies the call, nominally it
+                    # is not a Config, and building a real one here would drag
+                    # in every unrelated setting just to read two strings.
+                    cast("Config", _MinimalCfg(jupiter_base, jupiter_api_key)),
                     mint,
                     client=active_client,
                 )

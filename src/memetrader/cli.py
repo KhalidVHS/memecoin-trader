@@ -30,8 +30,8 @@ import typer
 from rich.logging import RichHandler
 
 from . import backfill as backfill_mod
+from . import cli_backtest, market, portfolio, report
 from . import config as config_mod
-from . import market, portfolio, report
 from .broker import LiveModeUnsupported
 from .config import Config
 from .http import make_client
@@ -51,6 +51,20 @@ app = typer.Typer(
     help="A deterministic strategy (optionally advised by Claude) trading three "
     "Solana memecoins against a paper book.",
     no_args_is_help=True,
+)
+
+# Mounted as a sub-app rather than shipped as its own console script: the
+# backtester is another way to run this same strategy, so `memetrader backtest
+# run` keeps one entry point and one place to discover what the tool can do.
+# ``add_typer`` needs the sub-app object at registration time, so this import
+# cannot be deferred — every `memetrader` invocation pays for importing the
+# replay stack. That is a real cost, accepted here because it is import-time
+# only (no I/O, no config read) and the alternative — a second console script —
+# splits the tool's surface in two to save it.
+app.add_typer(
+    cli_backtest.app,
+    name="backtest",
+    help="Replay a strategy against recorded history.",
 )
 
 _MODE_HELP = (

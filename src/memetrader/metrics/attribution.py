@@ -47,20 +47,17 @@ always populated; slices with None keys represent unattributed trades.
 from __future__ import annotations
 
 import datetime
-import math
-from dataclasses import dataclass, field
-from typing import Sequence
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 from memetrader.types import (
+    NON_EXECUTABLE_NOTICE,
     CostBreakdown,
     ExecutionReport,
     FidelityTier,
     Fill,
-    NON_EXECUTABLE_NOTICE,
     OrderState,
-    Side,
 )
-
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -105,7 +102,7 @@ class TradeAttribution:
     sizing_usd: float
     benchmark_usd: float
     # Slice keys for concentration analysis
-    month: str          # "YYYY-MM"
+    month: str  # "YYYY-MM"
     regime: str | None
     signal_id: str | None
     asset: str
@@ -146,25 +143,43 @@ class AttributionSummary:
 def _extract_costs(
     report: ExecutionReport,
     fill: Fill,
+    *,
+    landed: bool,
 ) -> CostBreakdown:
     """Return the CostBreakdown to use for this report.
 
     Prefer ``report.costs`` when present — it is the execution engine's
-    authoritative breakdown.  Fall back to the fields on the Fill itself:
-    pool_fee_usd maps to venue_fee, gas_usd to network_fee, and everything
-    else is zero.  This fall-back is explicitly conservative and partial; the
-    promotion gate should flag runs where costs had to be imputed this way.
+    authoritative breakdown.  Fall back to the fields on the Fill itself.
+
+    For a LANDED fill, pool_fee_usd maps to venue_fee and gas_usd to
+    network_fee — this is a real trade and the gas paid landed a swap.  For a
+    non-LANDED fill (FAILED/EXPIRED), gas_usd is money spent on a transaction
+    that never landed: it belongs entirely to failure_cost, not network_fee,
+    or a failed-transaction tail would silently vanish from attribution
+    instead of showing up as the cost it is (see module docstring).  This
+    fall-back is explicitly conservative and partial; the promotion gate
+    should flag runs where costs had to be imputed this way.
     """
     if report.costs is not None:
         return report.costs
+    if landed:
+        return CostBreakdown(
+            venue_fee_usd=fill.pool_fee_usd,
+            network_fee_usd=fill.gas_usd,
+            priority_fee_usd=0.0,
+            spread_usd=0.0,
+            price_impact_usd=0.0,
+            latency_cost_usd=0.0,
+            failure_cost_usd=0.0,
+        )
     return CostBreakdown(
-        venue_fee_usd=fill.pool_fee_usd,
-        network_fee_usd=fill.gas_usd,
+        venue_fee_usd=0.0,
+        network_fee_usd=0.0,
         priority_fee_usd=0.0,
         spread_usd=0.0,
         price_impact_usd=0.0,
         latency_cost_usd=0.0,
-        failure_cost_usd=0.0,
+        failure_cost_usd=fill.gas_usd,
     )
 
 
@@ -174,7 +189,7 @@ def _month_key(ts: float) -> str:
     Uses UTC to avoid timezone-dependent test failures — the codebase uses
     epoch seconds throughout, so UTC is the consistent interpretation.
     """
-    dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+    dt = datetime.datetime.fromtimestamp(ts, tz=datetime.UTC)
     return dt.strftime("%Y-%m")
 
 
@@ -241,9 +256,12 @@ def attribute_pnl(
     Parameters
     ----------
     reports:
-        All ExecutionReports from the run.  Only reports with a non-None fill
-        and state LANDED are attributed as completed trades; FAILED reports
-        contribute failure_cost from their fill's gas_usd.
+        All ExecutionReports from the run.  Reports with a ``None`` fill are
+        skipped (nothing was ever attempted at the venue).  A report whose
+        fill is present but not LANDED (FAILED/EXPIRED) still produces a
+        ``TradeAttribution``: it contributes its fill's gas_usd as
+        failure_cost_usd, zero gross_alpha_usd, and zero selection/sizing/
+        benchmark, since the order never touched the market.
     fidelity:
         FidelityTier of the run.  Any result below TIER_2 carries
         NON_EXECUTABLE_NOTICE.
@@ -286,29 +304,32 @@ def attribute_pnl(
         fill = report.fill
         if fill is None:
             continue
-        if report.state is not OrderState.LANDED:
-            # Failed/expired reports: count failure_cost only.
-            # We do not create a TradeAttribution for non-fills; the failure
-            # cost is captured in the fill's gas_usd on FAILED fills.
-            continue
 
-        costs = _extract_costs(report, fill)
+        landed = report.state is OrderState.LANDED
+        costs = _extract_costs(report, fill, landed=landed)
         realized = fill.realized_pnl_usd
 
         # gross_alpha is what we would have made with zero friction.
         # realized = gross_alpha - sum(costs), so gross_alpha = realized + sum(costs).
         gross_alpha = realized + costs.total_usd
 
-        # Benchmark decomposition
-        bench_return = 0.0
-        if benchmark_returns is not None:
-            bench_return = benchmark_returns.get(fill.symbol, 0.0)
+        if landed:
+            # Benchmark decomposition
+            bench_return = 0.0
+            if benchmark_returns is not None:
+                bench_return = benchmark_returns.get(fill.symbol, 0.0)
 
-        # selection = gross_alpha vs benchmark; sizing = 0 (requires portfolio
-        # constructor data not available here); benchmark = benchmark return.
-        selection = gross_alpha - bench_return
-        sizing = 0.0
-        bench = bench_return
+            # selection = gross_alpha vs benchmark; sizing = 0 (requires portfolio
+            # constructor data not available here); benchmark = benchmark return.
+            selection = gross_alpha - bench_return
+            sizing = 0.0
+            bench = bench_return
+        else:
+            # A failed/expired order never touched the market: there is no
+            # execution alpha to attribute to selection, sizing or benchmark.
+            selection = 0.0
+            sizing = 0.0
+            bench = 0.0
 
         sym = fill.symbol
         month = _month_key(fill.ts)

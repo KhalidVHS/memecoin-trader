@@ -14,7 +14,6 @@ from memetrader.backtest.clock import SimulatedClock
 from memetrader.backtest.event_queue import EventQueue, EventQueueError
 from memetrader.types import EventKind, HistoricalEvent
 
-
 # ---------------------------------------------------------------------------
 # Fixture helpers
 # ---------------------------------------------------------------------------
@@ -69,8 +68,12 @@ def test_multi_stream_merge_is_sorted() -> None:
     This is the core invariant: the heap merge must produce the same global
     order as if all events were sorted together up front.
     """
-    stream_a = [_make_event(t, sequence=i, source="A") for i, t in enumerate([1.0, 3.0, 5.0])]
-    stream_b = [_make_event(t, sequence=i, source="B") for i, t in enumerate([2.0, 4.0, 6.0])]
+    stream_a = [
+        _make_event(t, sequence=i, source="A") for i, t in enumerate([1.0, 3.0, 5.0])
+    ]
+    stream_b = [
+        _make_event(t, sequence=i, source="B") for i, t in enumerate([2.0, 4.0, 6.0])
+    ]
     clock = _clock()
     queue = EventQueue(clock, streams=[iter(stream_a), iter(stream_b)])
     result = _drain(queue)
@@ -115,8 +118,7 @@ def test_queue_order_is_stable_under_shuffled_insertion() -> None:
 def test_two_runs_same_shuffled_input_identical_sequence() -> None:
     """Two runs over the same shuffled input produce identical event sequences."""
     events = [
-        _make_event(float(t), sequence=i, source="src")
-        for i, t in enumerate(range(20))
+        _make_event(float(t), sequence=i, source="src") for i, t in enumerate(range(20))
     ]
     shuffled = events.copy()
     random.Random(99).shuffle(shuffled)
@@ -238,6 +240,28 @@ def test_out_of_order_stream_raises() -> None:
     # Second event triggers the guard.
     with pytest.raises(EventQueueError, match="not sorted"):
         next(queue)
+
+
+def test_out_of_order_stream_is_not_silently_dropped_by_a_while_loop() -> None:
+    """Guard: draining with ``while queue:`` still surfaces the error.
+
+    The unsorted event is never pushed onto the heap, so after the good event
+    is consumed the heap is empty.  If ``__bool__`` reported the queue as
+    exhausted at that point, the loop would exit normally and the run would
+    finish as though the stream had been fine — the detection would be real
+    and the report would be lost, which is worse than not checking at all.
+    """
+
+    def bad_stream() -> Iterator[HistoricalEvent]:
+        yield _make_event(5.0, sequence=0)
+        yield _make_event(3.0, sequence=0)  # out of order
+
+    queue = EventQueue(_clock(), streams=[bad_stream()])
+    drained: list[HistoricalEvent] = []
+    with pytest.raises(EventQueueError, match="not sorted"):
+        while queue:
+            drained.append(next(queue))
+    assert len(drained) == 1, "the valid event must still be delivered"
 
 
 # ---------------------------------------------------------------------------

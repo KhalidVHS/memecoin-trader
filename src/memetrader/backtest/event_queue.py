@@ -118,6 +118,17 @@ class EventQueue:
         # rather than events because HistoricalEvent.payload is an arbitrary
         # object and is not hashable in general.
         self._seen_keys: set[tuple[float, int, int, str, str]] = set()
+        # Set when a refill discovers an unsorted stream; raised by the next
+        # ``__next__`` call.  See the comment in ``__next__`` for why the error
+        # is deferred rather than raised at the point of discovery.
+        self._pending_error: EventQueueError | None = None
+        # Maps the sort_key of a stream's leading heap entry to that stream's
+        # index.  This is how ``__next__`` knows which stream to refill after a
+        # pop: we tag each stream-sourced entry when we push it and drop the tag
+        # when we pop it.  Kept beside the heap rather than inside the heap
+        # tuple, because a third tuple element would join the comparison and
+        # change the total order the whole class exists to guarantee.
+        self._key_to_stream: dict[tuple[float, int, int, str, str], int] = {}
 
         # Initialise one sentinel per stream.  ``_advance_stream`` pulls the
         # first event from each and pushes it onto the heap.
@@ -178,6 +189,16 @@ class EventQueue:
         the number of active streams plus the number of pushed-but-not-yet-
         yielded events.
         """
+        # A refill triggered by the *previous* pop may have found the stream
+        # unsorted.  That error belongs here, not there: the event the previous
+        # pop returned was itself valid, and swallowing it to report a problem
+        # with the event *after* it would drop a good event on the floor and
+        # make the exception point depend on the heap's refill timing rather
+        # than on which event is actually bad.
+        if self._pending_error is not None:
+            err = self._pending_error
+            self._pending_error = None
+            raise err
         if not self._heap:
             raise StopIteration
         key, event = heapq.heappop(self._heap)
@@ -187,12 +208,25 @@ class EventQueue:
         # would change the comparison semantics.
         if key in self._key_to_stream:
             idx = self._key_to_stream.pop(key)
-            self._advance_stream(idx)
+            try:
+                self._advance_stream(idx)
+            except EventQueueError as exc:
+                # Defer: surface it on the next pop, after this valid event
+                # has been delivered.
+                self._pending_error = exc
         return event
 
     def __bool__(self) -> bool:
-        """``True`` iff the queue has at least one more event."""
-        return bool(self._heap)
+        """``True`` iff the queue has at least one more event, or a deferred
+        error still to raise.
+
+        The second half matters: a ``while queue:`` loop must not exit quietly
+        while an unsorted-stream error is still pending.  If it did, the queue
+        would have detected a corrupt stream and then let the run finish as
+        though nothing were wrong — which is the exact outcome this guard
+        exists to prevent.
+        """
+        return bool(self._heap) or self._pending_error is not None
 
     def peek(self) -> HistoricalEvent | None:
         """Return the next event without consuming it, or ``None`` if empty."""
@@ -203,23 +237,6 @@ class EventQueue:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-
-    @property
-    def _key_to_stream(self) -> dict[tuple[float, int, int, str, str], int]:
-        """Lazy-initialised mapping from the sort_key of a stream's leading
-        event to that stream's index.
-
-        This is how ``__next__`` knows which stream to advance after popping:
-        we tag each stream-sourced heap entry when we push it, and remove the
-        tag when we pop it.
-        """
-        try:
-            return self.__key_to_stream  # type: ignore[attr-defined]
-        except AttributeError:
-            self.__key_to_stream: dict[
-                tuple[float, int, int, str, str], int
-            ] = {}
-            return self.__key_to_stream
 
     def _advance_stream(self, stream_idx: int) -> None:
         """Pull one event from stream ``stream_idx`` and push it to the heap.

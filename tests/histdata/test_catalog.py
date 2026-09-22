@@ -6,17 +6,12 @@ history directory required.
 
 from __future__ import annotations
 
-import gzip
-import json
 import time
 from pathlib import Path
 
-import pytest
-
-from memetrader.backfill import RawBar, SeriesMeta, write_series, write_manifest
-from memetrader.histdata.catalog import Catalog, PartitionInfo
+from memetrader.backfill import RawBar, SeriesMeta, write_manifest, write_series
+from memetrader.histdata.catalog import Catalog
 from memetrader.types import Timeframe
-
 
 # ---------------------------------------------------------------------------
 # Helpers to build fixture data
@@ -31,8 +26,9 @@ def _write_bar_file(root: Path, pool: str, tf: str, bars: list[RawBar]) -> Path:
     return path
 
 
-def _make_raw_bars(count: int, base_ts: float = 1_700_000_000.0,
-                   interval: float = 3600.0) -> list[RawBar]:
+def _make_raw_bars(
+    count: int, base_ts: float = 1_700_000_000.0, interval: float = 3600.0
+) -> list[RawBar]:
     """Generate synthetic closed bars."""
     return [
         RawBar(

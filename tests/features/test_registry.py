@@ -17,11 +17,11 @@ Tests cover:
 from __future__ import annotations
 
 import json
+from typing import cast
 
 import pytest
 
 from memetrader.features.registry import FeatureDefinition, FeatureRegistry
-
 
 # ---------------------------------------------------------------------------
 # Construction guards
@@ -278,7 +278,9 @@ def test_as_manifest_dict_sorted_by_name() -> None:
             )
         )
     manifest = reg.as_manifest_dict()
-    names = [d["name"] for d in manifest]
+    # as_manifest_dict is typed dict[str, object] since entries mix strs, ints,
+    # and bools; "name" is known (by construction above) to always be a str.
+    names = [cast(str, d["name"]) for d in manifest]
     assert names == sorted(names)
 
 
